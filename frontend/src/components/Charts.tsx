@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import {
-  CandlestickSeries, ColorType, createChart, createSeriesMarkers, HistogramSeries, LineSeries, LineStyle,
+  CandlestickSeries, ColorType, createChart, createSeriesMarkers, HistogramSeries, LineSeries, LineStyle, TickMarkType,
   type IChartApi, type ISeriesApi, type SeriesMarker, type Time, type UTCTimestamp,
 } from "lightweight-charts";
 import { useUi } from "@/store/auth";
@@ -16,6 +16,26 @@ function palette(theme: "dark" | "light") {
   };
 }
 
+// lightweight-charts renders timestamps in UTC; these formatters show the browser's local time instead.
+const toDate = (t: Time) => new Date((t as number) * 1000);
+const pad = (n: number) => String(n).padStart(2, "0");
+
+function localTick(t: Time, type: TickMarkType): string {
+  const d = toDate(t);
+  switch (type) {
+    case TickMarkType.Year: return String(d.getFullYear());
+    case TickMarkType.Month: return d.toLocaleString(undefined, { month: "short" });
+    case TickMarkType.DayOfMonth: return String(d.getDate());
+    case TickMarkType.TimeWithSeconds: return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    default: return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+}
+
+function localCrosshair(t: Time): string {
+  const d = toDate(t);
+  return `${d.toLocaleDateString(undefined, { day: "2-digit", month: "short", year: "2-digit" })} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 function useChart(height: number) {
   const ref = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -27,7 +47,9 @@ function useChart(height: number) {
       height, autoSize: true,
       layout: { background: { type: ColorType.Solid, color: p.bg }, textColor: p.text, fontSize: 11 },
       grid: { vertLines: { color: p.grid }, horzLines: { color: p.grid } },
-      rightPriceScale: { borderColor: p.grid }, timeScale: { borderColor: p.grid, timeVisible: true },
+      rightPriceScale: { borderColor: p.grid },
+      timeScale: { borderColor: p.grid, timeVisible: true, tickMarkFormatter: localTick },
+      localization: { timeFormatter: localCrosshair },
     });
     chartRef.current = chart;
     return () => { chart.remove(); chartRef.current = null; };
