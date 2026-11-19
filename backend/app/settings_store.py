@@ -87,6 +87,10 @@ class StrategySettings(BaseModel):
     exit_on_trend_reversal: bool = True
     ml_filter_enabled: bool = False
     ml_min_probability: Decimal = Field(D("0.55"), ge=0, le=1)
+    # Market-regime filter: no new long entries while the market leader (BTC) is in a
+    # downtrend on the trend timeframe (close < EMA50 and EMA20 < EMA50). Exits unaffected.
+    market_filter_enabled: bool = True
+    market_filter_symbol: str = Field("BTCUSDT", pattern=r"^[A-Z0-9]{2,20}USDT$")
 
     @model_validator(mode="after")
     def _check(self) -> "StrategySettings":

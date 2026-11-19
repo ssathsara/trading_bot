@@ -106,6 +106,26 @@ def classify_market(df: pd.DataFrame) -> MarketCondition:
                            (atr_v / close * 100) if atr_v and close else None)
 
 
+@dataclass
+class MarketRegime:
+    """Trend of the market leader (e.g. BTC). ``bearish`` is None when it cannot be judged."""
+    bearish: bool | None
+    detail: str
+
+
+def market_regime(df: pd.DataFrame | None, symbol: str, timeframe: str) -> MarketRegime:
+    """Bearish = latest CLOSED candle below EMA50 with EMA20 below EMA50 (a confirmed downtrend)."""
+    if df is None or len(df) < 60:
+        return MarketRegime(None, f"{symbol} {timeframe}: not enough candles to judge the market trend")
+    last = df.iloc[-1]
+    close, e20, e50 = (_f(last.get(k)) for k in ("close", "ema_20", "ema_50"))
+    if None in (close, e20, e50):
+        return MarketRegime(None, f"{symbol} {timeframe}: market trend indicators not available")
+    bearish = close < e50 and e20 < e50  # type: ignore[operator]
+    return MarketRegime(bearish, f"{symbol} {timeframe} close {close:.6g}, EMA20 {e20:.6g}, EMA50 {e50:.6g}: "
+                                 + ("downtrend - no new buys" if bearish else "not in a downtrend"))
+
+
 def _snapshot(df: pd.DataFrame) -> dict:
     last = df.iloc[-1]
     keys = ("close", "rsi", "ema_9", "ema_20", "ema_50", "ema_200", "macd", "macd_signal", "macd_hist",
@@ -126,6 +146,7 @@ def evaluate(
     ml_probability: float | None = None,
     ml_available: bool = False,
     detail: bool = True,
+    market: MarketRegime | None = None,
 ) -> SignalResult:
     """Evaluate the strategy on frames keyed by role: ``trend``, ``setup``, ``entry``.
 
@@ -207,6 +228,10 @@ def evaluate(
         else:
             ok = ml_probability >= float(settings.ml_min_probability)
             entry.append(Condition("ml_filter", ok, f"ML P(up) {ml_probability:.2f} (min {settings.ml_min_probability})", True))
+    if settings.market_filter_enabled:
+        # fail-safe: an unknown market trend blocks entries just like a bearish one
+        entry.append(Condition("market_regime", market is not None and market.bearish is False,
+                               market.detail if market else f"{settings.market_filter_symbol}: market trend unavailable", True))
 
     s_rev = s_close < s_e50 and not macd_ok  # type: ignore[operator]
     exits = [

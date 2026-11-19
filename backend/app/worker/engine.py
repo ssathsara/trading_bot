@@ -27,7 +27,7 @@ from sqlalchemy import func, select
 
 from app.analysis import ml
 from app.analysis.indicators import compute_indicators
-from app.analysis.strategy import SignalResult, evaluate
+from app.analysis.strategy import MarketRegime, SignalResult, evaluate, market_regime
 from app.audit import log_event, risk_event
 from app.config import ExecutionMode, Settings
 from app.db import numeric, session_scope
@@ -97,6 +97,7 @@ class TradingEngine:
         self._queued: set[str] = set()
         self._position_check = asyncio.Event()
         self._bg_tasks: set[asyncio.Task] = set()
+        self._regime_cache: dict[tuple[str, str], tuple[float, MarketRegime]] = {}
         # Serialises exit placement and exchange-stop maintenance per position, so a stop
         # can never be (re)placed between cancelling it and submitting the exit.
         self._pos_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -305,10 +306,13 @@ class TradingEngine:
         bus.publish("market", "universe", {"symbols": self.top_symbols})
 
     def watch_symbols(self) -> list[str]:
-        """Top-N plus any symbol with an open position (positions must always stay monitored)."""
+        """Top-N plus any symbol with an open position (positions must always stay monitored),
+        plus the market-filter symbol so its trend data is always kept current."""
         with session_scope() as s:
             held = [p.symbol for p in pf.open_positions(s, self.mode)]
-        return list(dict.fromkeys(self.top_symbols + held))
+            strat = get_strategy(s)
+        extra = [strat.market_filter_symbol] if strat.market_filter_enabled else []
+        return list(dict.fromkeys(self.top_symbols + held + extra))
 
     # A closed candle is only "expected" in the DB this long after it closed, so the
     # integrity check does not race the WebSocket's own close event.
@@ -523,8 +527,25 @@ class TradingEngine:
         frames = {role: compute_indicators(df) for role, df in raw.items()}
         return frames, issues, (strat, risk)
 
+    REGIME_CACHE_S = 30
+
+    def current_market_regime(self, strat) -> MarketRegime | None:
+        """Market-leader trend on the strategy's trend timeframe, computed at most every 30s."""
+        if not strat.market_filter_enabled:
+            return None
+        key = (strat.market_filter_symbol, strat.trend_timeframe)
+        cached = self._regime_cache.get(key)
+        if cached and time.monotonic() - cached[0] < self.REGIME_CACHE_S:
+            return cached[1]
+        with session_scope() as s:
+            df = cd.load_frame(s, key[0], key[1], 300)
+        regime = market_regime(compute_indicators(df) if len(df) else None, *key)
+        self._regime_cache[key] = (time.monotonic(), regime)
+        return regime
+
     async def analyse_and_act(self, symbol: str) -> SignalResult:
         frames, issues, (strat, risk) = await asyncio.to_thread(self.build_frames, symbol)
+        regime = await asyncio.to_thread(self.current_market_regime, strat)
         with session_scope() as s:
             has_pos = s.scalar(select(Position.id).where(Position.execution_mode == self.mode, Position.symbol == symbol,
                                                          Position.status == "OPEN")) is not None
@@ -532,7 +553,7 @@ class TradingEngine:
         if strat.ml_filter_enabled and len(frames["setup"]):
             proba, available = await asyncio.to_thread(ml.predict_proba, frames["setup"], symbol, strat.setup_timeframe)
         result = evaluate(symbol, frames, strat, max_atr_pct=float(risk.max_atr_pct), has_position=has_pos,
-                          data_issues=issues, ml_probability=proba, ml_available=available)
+                          data_issues=issues, ml_probability=proba, ml_available=available, market=regime)
         signal_id = self._persist_signal(symbol, result, frames, strat)
         self.last_analysis[symbol] = time.time()
         if has_pos:
@@ -567,8 +588,10 @@ class TradingEngine:
                                                 Position.status == "OPEN"))
             if p is None or p.stop_loss is None or p.take_profit is None:
                 return
+            # Use only prices observed since entry: the analysed candle may predate the position,
+            # and on testnet the order book is a different market than the candle feed.
             adj = adjust_exits(entry=p.average_entry_price, stop=p.stop_loss, target=p.take_profit,
-                               highest=max(p.highest_price or close, close), close=close, atr=atr,
+                               highest=p.highest_price or p.average_entry_price, close=p.current_price or close, atr=atr,
                                adx=num("adx"), ema_20=num("ema_20"), rsi=num("rsi"), rs=rs, tick=tick,
                                cost_rate=ex.estimated_fee_rate + ex.estimated_slippage_bps / Decimal("10000"))
             if adj.stop == p.stop_loss and adj.target == p.take_profit:

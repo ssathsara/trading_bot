@@ -9,7 +9,7 @@ from app.settings_store import RiskSettings, StrategySettings
 from tests.conftest import make_ohlcv
 
 LOOSE = StrategySettings(rsi_entry_min=D("0"), rsi_entry_max=D("100"), min_adx=D("0"), min_score=D("40"),
-                         min_volume_ratio=D("0"))
+                         min_volume_ratio=D("0"), market_filter_enabled=False)
 RISK = RiskSettings(max_atr_pct=D("50"))
 
 
@@ -75,3 +75,16 @@ def test_backtest_rejects_bad_input():
         run_backtest(make_ohlcv(100), BacktestParams("T", "15m"), LOOSE, RISK)
     with pytest.raises(ValueError):
         run_backtest(make_ohlcv(400), BacktestParams("T", "3m"), LOOSE, RISK)
+
+
+def test_backtest_market_filter_blocks_entries_in_btc_downtrend():
+    df = make_ohlcv(1500, drift=0.0006, vol=0.006, seed=11)
+    on = LOOSE.model_copy(update={"market_filter_enabled": True})
+    bear = make_ohlcv(1500, drift=-0.001, vol=0.003, seed=3)
+    bull = make_ohlcv(1500, drift=0.001, vol=0.003, seed=3)
+    base = run_backtest(df, BacktestParams("TESTUSDT", "15m"), LOOSE, RISK)["metrics"]["number_of_trades"]
+    blocked = run_backtest(df, BacktestParams("TESTUSDT", "15m"), on, RISK, market_candles=bear)["metrics"]["number_of_trades"]
+    allowed = run_backtest(df, BacktestParams("TESTUSDT", "15m"), on, RISK, market_candles=bull)["metrics"]["number_of_trades"]
+    no_data = run_backtest(df, BacktestParams("TESTUSDT", "15m"), on, RISK)["metrics"]["number_of_trades"]
+    assert base > 0 and allowed > 0
+    assert blocked < allowed and no_data == 0

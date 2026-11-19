@@ -19,7 +19,8 @@ def frames(drift=0.002, vol=0.003, seed=4, boost_last_volume=True):
 
 
 def loosened(**kw):
-    base = dict(rsi_entry_min=Decimal("0"), rsi_entry_max=Decimal("100"), min_adx=Decimal("0"), min_score=Decimal("50"))
+    base = dict(rsi_entry_min=Decimal("0"), rsi_entry_max=Decimal("100"), min_adx=Decimal("0"), min_score=Decimal("50"),
+                market_filter_enabled=False)
     base.update(kw)
     return StrategySettings(**base)
 
@@ -40,7 +41,8 @@ def test_bearish_market_holds():
 
 def test_low_rsi_alone_never_buys():
     """Oversold RSI in a downtrend must not produce a BUY."""
-    s = StrategySettings(rsi_entry_min=Decimal("0"), rsi_entry_max=Decimal("35"), min_adx=Decimal("0"), min_score=Decimal("0"))
+    s = StrategySettings(rsi_entry_min=Decimal("0"), rsi_entry_max=Decimal("35"), min_adx=Decimal("0"), min_score=Decimal("0"),
+                         market_filter_enabled=False)
     r = evaluate("BTCUSDT", frames(drift=-0.003), s, max_atr_pct=10)
     assert r.signal == "HOLD"
 
@@ -84,3 +86,37 @@ def test_ml_filter_fails_closed_without_model():
     r = evaluate("BTCUSDT", frames(), loosened(ml_filter_enabled=True), max_atr_pct=10, ml_available=False)
     assert r.signal == "HOLD"
     assert any(c.name == "ml_filter" and not c.passed for c in r.entry_conditions)
+
+
+# ---- market-regime filter -------------------------------------------------------
+from app.analysis.strategy import MarketRegime, market_regime  # noqa: E402
+
+
+def test_market_regime_classifies_btc_trend():
+    up = compute_indicators(make_ohlcv(300, drift=0.003, vol=0.003, seed=4, freq="4h"))
+    down = compute_indicators(make_ohlcv(300, drift=-0.003, vol=0.003, seed=4, freq="4h"))
+    assert market_regime(up, "BTCUSDT", "4h").bearish is False
+    r = market_regime(down, "BTCUSDT", "4h")
+    assert r.bearish is True and "downtrend" in r.detail
+    assert market_regime(up.head(30), "BTCUSDT", "4h").bearish is None  # too little data
+    assert market_regime(None, "BTCUSDT", "4h").bearish is None
+
+
+def test_market_filter_blocks_buy_when_btc_bearish():
+    s = loosened(market_filter_enabled=True)
+    ok = evaluate("ETHUSDT", frames(), s, max_atr_pct=10, market=MarketRegime(False, "BTC fine"))
+    assert ok.signal == "BUY", ok.reason
+    bad = evaluate("ETHUSDT", frames(), s, max_atr_pct=10, market=MarketRegime(True, "BTCUSDT 4h ... downtrend - no new buys"))
+    assert bad.signal == "HOLD" and "market_regime" in bad.reason and "downtrend" in bad.reason
+
+
+def test_market_filter_fails_safe_without_data():
+    s = loosened(market_filter_enabled=True)
+    assert evaluate("ETHUSDT", frames(), s, max_atr_pct=10, market=None).signal == "HOLD"
+    assert evaluate("ETHUSDT", frames(), s, max_atr_pct=10, market=MarketRegime(None, "no data")).signal == "HOLD"
+
+
+def test_market_filter_never_blocks_exits():
+    s = loosened(market_filter_enabled=True)
+    r = evaluate("ETHUSDT", frames(drift=-0.003), s, max_atr_pct=10, has_position=True, market=MarketRegime(True, "bear"))
+    assert r.signal == "SELL"

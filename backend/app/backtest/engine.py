@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 
 from app.analysis.indicators import compute_indicators
-from app.analysis.strategy import evaluate
+from app.analysis.strategy import evaluate, market_regime
 from app.exchange.filters import SymbolFilters
 from app.risk.engine import AccountSnapshot, EntryRequest, adjust_exits, check_hard_limits, evaluate_entry
 from app.settings_store import ExecutionSettings, RiskSettings, StrategySettings
@@ -72,7 +72,10 @@ class BacktestParams:
 
 
 def run_backtest(candles: pd.DataFrame, p: BacktestParams, strategy: StrategySettings, risk: RiskSettings,
-                 filters: SymbolFilters | None = None) -> dict:
+                 filters: SymbolFilters | None = None, market_candles: pd.DataFrame | None = None) -> dict:
+    """``market_candles``: the market-filter symbol's candles (same timeframe/range) for the
+    market-regime filter. Not needed when backtesting that symbol itself. If the filter is
+    enabled and no market data is given, entries are blocked (same fail-safe as live)."""
     if p.timeframe not in HIGHER_TF:
         raise ValueError(f"unsupported backtest timeframe {p.timeframe}")
     if len(candles) < 300:
@@ -89,6 +92,15 @@ def run_backtest(candles: pd.DataFrame, p: BacktestParams, strategy: StrategySet
     ex = ExecutionSettings(estimated_fee_rate=p.fee_rate, estimated_slippage_bps=p.slippage_bps)
     f = filters or default_filters(p.symbol)
     slip = p.slippage_bps / Decimal("10000")
+
+    mtrend = None
+    if strategy.market_filter_enabled:
+        if p.symbol == strategy.market_filter_symbol:
+            mtrend = trend
+        elif market_candles is not None and len(market_candles):
+            mc = market_candles.sort_values("open_time").drop_duplicates("open_time").reset_index(drop=True)
+            mtrend = compute_indicators(resample_closed(mc, higher, factor))
+    mtrend_close = mtrend["close_time"].to_numpy() if mtrend is not None else None
 
     trend_close = trend["close_time"].to_numpy()
     base_close = base["close_time"].to_numpy()
@@ -193,8 +205,14 @@ def run_backtest(candles: pd.DataFrame, p: BacktestParams, strategy: StrategySet
             continue
         frames = {"trend": trend.iloc[max(0, t_idx - 150): t_idx + 1],
                   "setup": base.iloc[i - 150: i + 1], "entry": base.iloc[i - 150: i + 1]}
+        regime = None
+        if strat.market_filter_enabled and pos is None:
+            if mtrend is not None:
+                m_idx = int(np.searchsorted(mtrend_close, base_close[i], side="right")) - 1  # closed candles only
+                regime = market_regime(mtrend.iloc[max(0, m_idx - 150): m_idx + 1] if m_idx >= 0 else None,
+                                       strat.market_filter_symbol, higher)
         r = evaluate(p.symbol, frames, strat, max_atr_pct=float(risk.max_atr_pct), has_position=pos is not None,
-                     detail=False)
+                     detail=False, market=regime)
         if r.signal == "SELL" and pos is not None:
             pending = "SELL"
         elif r.signal == "BUY" and pos is None and halted_at is None:

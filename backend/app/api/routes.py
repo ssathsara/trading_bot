@@ -532,8 +532,12 @@ async def _run_backtest_job(run_id: int, req: sc.BacktestRequest) -> None:
         start_ms, end_ms = int(req.start.timestamp() * 1000), int(req.end.timestamp() * 1000)
         candles = await cd.fetch_range(market_client(), req.symbol, req.timeframe, start_ms, end_ms)
         df = cd.candles_to_frame(candles)
+        market_df = None
+        if strategy.market_filter_enabled and req.symbol != strategy.market_filter_symbol:
+            market_df = cd.candles_to_frame(await cd.fetch_range(market_client(), strategy.market_filter_symbol,
+                                                                 req.timeframe, start_ms, end_ms))
         params = BacktestParams(req.symbol, req.timeframe, req.initial_balance, req.fee_rate, req.slippage_bps, req.risk_pct)
-        result = await asyncio.to_thread(run_backtest, df, params, strategy, risk)
+        result = await asyncio.to_thread(run_backtest, df, params, strategy, risk, None, market_df)
         with session_scope() as s:
             run = s.get(BacktestRun, run_id)
             run.status, run.metrics = "DONE", {**result["metrics"], "candles": len(df)}

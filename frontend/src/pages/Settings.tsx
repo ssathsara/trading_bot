@@ -90,6 +90,13 @@ export default function SettingsPage() {
                   onChange={(v) => setStrategy({ ...strategy, exit_on_trend_reversal: v })} />Exit on trend reversal</label>
                 <label className="col-span-full flex items-center gap-2 text-sm"><Switch checked={strategy.ml_filter_enabled} label="ML filter"
                   onChange={(v) => setStrategy({ ...strategy, ml_filter_enabled: v })} />ML filter (requires a validated model; fails closed)</label>
+                <label className="col-span-full flex items-center gap-2 text-sm"><Switch checked={!!strategy.market_filter_enabled} label="Market filter"
+                  onChange={(v) => setStrategy({ ...strategy, market_filter_enabled: v })} />Market filter: no new buys while the market leader is in a downtrend (trend timeframe; fails closed)</label>
+                {strategy.market_filter_enabled && (
+                  <label className="text-xs text-muted">Market leader symbol
+                    <Input className="num mt-1" value={strategy.market_filter_symbol ?? "BTCUSDT"}
+                      onChange={(e) => setStrategy({ ...strategy, market_filter_symbol: e.target.value.toUpperCase() })} /></label>
+                )}
               </div>
             )}
           </CardContent>

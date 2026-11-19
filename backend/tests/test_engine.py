@@ -96,7 +96,8 @@ def configured(monkeypatch):
     monkeypatch.setattr(engine_mod, "PublicTestnetProbe", NoTestnet)
     with session_scope() as s:
         save(s, "strategy", StrategySettings(rsi_entry_min=D("0"), rsi_entry_max=D("100"), min_adx=D("0"),
-                                             min_score=D("40"), min_volume_ratio=D("0")))
+                                             min_score=D("40"), min_volume_ratio=D("0"),
+                                             market_filter_enabled=False))
         save(s, "market", MarketSettings(top_n=10, min_history_candles=250, history_candles=300))
         save(s, "risk", RiskSettings(max_atr_pct=D("50")))
         ctl = get_control(s)
