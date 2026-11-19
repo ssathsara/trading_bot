@@ -118,6 +118,7 @@ def run_backtest(candles: pd.DataFrame, p: BacktestParams, strategy: StrategySet
     total_fees = ZERO
     halted_at = None
     consecutive_losses, last_loss_at = 0, None
+    last_exit_at = None
     warmup = 210
     exposure_bars = 0
 
@@ -126,7 +127,7 @@ def run_backtest(candles: pd.DataFrame, p: BacktestParams, strategy: StrategySet
         return px * (1 + slip) if side == "BUY" else px * (1 - slip)
 
     def close_pos(i: int, price: Decimal, reason: str) -> None:
-        nonlocal cash, pos, total_fees, consecutive_losses, last_loss_at
+        nonlocal cash, pos, total_fees, consecutive_losses, last_loss_at, last_exit_at
         assert pos is not None
         proceeds = pos["qty"] * price
         fee = proceeds * p.fee_rate
@@ -141,6 +142,7 @@ def run_backtest(candles: pd.DataFrame, p: BacktestParams, strategy: StrategySet
             last_loss_at = base["open_time"].iloc[i].to_pydatetime()
         else:
             consecutive_losses = 0
+        last_exit_at = base["open_time"].iloc[i].to_pydatetime()
         pos = None
 
     for i in range(warmup, len(base)):
@@ -218,7 +220,9 @@ def run_backtest(candles: pd.DataFrame, p: BacktestParams, strategy: StrategySet
         elif r.signal == "BUY" and pos is None and halted_at is None:
             d = evaluate_entry(EntryRequest(symbol=p.symbol, entry_price=Decimal(str(closes[i])) * (1 + slip),
                                             atr=Decimal(str(r.atr)) if r.atr else None, filters=f,
-                                            now=base["close_time"].iloc[i].to_pydatetime()), acct, risk, ex)
+                                            now=base["close_time"].iloc[i].to_pydatetime(),
+                                            symbol_last_loss_at=last_loss_at, symbol_last_exit_at=last_exit_at),
+                               acct, risk, ex)
             if d.approved:
                 pending, pending_decision, signal_time = "BUY", d, str(ts)
 

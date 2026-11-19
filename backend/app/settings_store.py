@@ -44,6 +44,8 @@ class RiskSettings(BaseModel):
     dyn_tp_tighten_atr_mult: Decimal = Field(D("1"), gt=0, le=20)   # ... to close + N x ATR
     max_consecutive_losses: int = Field(3, ge=1, le=50)
     cooldown_minutes: int = Field(60, ge=0, le=10080)
+    # wait this long after ANY exit on a symbol before buying it again (0 = off)
+    reentry_cooldown_minutes: int = Field(0, ge=0, le=10080)
     max_order_notional_usdt: Decimal = Field(D("2500"), gt=0)
     max_atr_pct: Decimal = Field(D("5"), gt=0, le=100)  # volatility protection (ATR as % of price)
     stale_data_seconds: int = Field(30, ge=5, le=600)

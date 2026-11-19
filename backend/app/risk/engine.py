@@ -47,6 +47,7 @@ class EntryRequest:
     data_stale: bool = False
     connectivity_ok: bool = True
     symbol_last_loss_at: datetime | None = None
+    symbol_last_exit_at: datetime | None = None
     market_order: bool = True
 
 
@@ -132,6 +133,10 @@ def evaluate_entry(req: EntryRequest, acct: AccountSnapshot, rs: RiskSettings, e
         until = req.symbol_last_loss_at + timedelta(minutes=rs.cooldown_minutes)
         if req.now < until:
             rej.append(f"cooldown after loss on {req.symbol} until {until.isoformat()}")
+    if req.symbol_last_exit_at is not None and rs.reentry_cooldown_minutes > 0:
+        until = req.symbol_last_exit_at + timedelta(minutes=rs.reentry_cooldown_minutes)
+        if req.now < until:
+            rej.append(f"re-entry cooldown on {req.symbol} until {until.isoformat()}")
     if not req.filters.tradable:
         rej.append(f"{req.symbol} not tradable on exchange")
     if req.entry_price <= 0:

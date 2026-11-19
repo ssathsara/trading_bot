@@ -670,6 +670,8 @@ class TradingEngine:
             acct = self.account_snapshot(s)
             last_loss = s.scalar(select(func.max(Position.closed_at)).where(
                 Position.execution_mode == self.mode, Position.symbol == symbol, numeric(Position.realised_pnl) < 0))
+            last_exit = s.scalar(select(func.max(Position.closed_at)).where(
+                Position.execution_mode == self.mode, Position.symbol == symbol))
             has_pos = s.scalar(select(Position.id).where(Position.execution_mode == self.mode, Position.symbol == symbol,
                                                          Position.status.in_(("OPEN", "CLOSING")))) is not None
             has_pending = self.om.has_active_entry(s, symbol)
@@ -683,7 +685,8 @@ class TradingEngine:
         req = EntryRequest(symbol=symbol, entry_price=entry_price, atr=Decimal(str(result.atr)) if result.atr else None,
                            filters=f, now=datetime.now(timezone.utc), has_open_position=has_pos,
                            has_pending_order=has_pending, data_stale=stale, connectivity_ok=self.connectivity_ok(),
-                           symbol_last_loss_at=last_loss, market_order=market_order)
+                           symbol_last_loss_at=last_loss, symbol_last_exit_at=last_exit,
+                           market_order=market_order)
         decision = evaluate_entry(req, acct, rs, ex)
         if decision.hard_breach:
             await self.halt(decision.hard_breach, "; ".join(decision.reasons))

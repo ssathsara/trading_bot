@@ -14,6 +14,7 @@ const FIELDS: [string, string, string?][] = [
   ["max_order_notional_usdt", "Max order size (USDT)"],
   ["max_consecutive_losses", "Max consecutive losses"],
   ["cooldown_minutes", "Cooldown after losses (min)"],
+  ["reentry_cooldown_minutes", "Re-entry cooldown after any exit (min)"],
   ["max_atr_pct", "Volatility limit (ATR % of price)"],
   ["stale_data_seconds", "Stale-data threshold (s)"],
   ["stop_loss_atr_mult", "Stop-loss ATR multiple", "ATR"],

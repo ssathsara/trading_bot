@@ -106,6 +106,17 @@ def test_safety_rejections(btc_filters):
     assert "cooldown after loss" in sym.reasons[0]
 
 
+def test_reentry_cooldown_after_any_exit(btc_filters):
+    recent = NOW - timedelta(minutes=30)
+    # off by default: a recent (winning) exit does not block
+    assert evaluate_entry(req(btc_filters, symbol_last_exit_at=recent), acct(), RiskSettings(), NO_COST).approved
+    rs = RiskSettings(reentry_cooldown_minutes=120)
+    d = evaluate_entry(req(btc_filters, symbol_last_exit_at=recent), acct(), rs, NO_COST)
+    assert not d.approved and "re-entry cooldown" in d.reasons[0]
+    old = NOW - timedelta(minutes=121)
+    assert evaluate_entry(req(btc_filters, symbol_last_exit_at=old), acct(), rs, NO_COST).approved
+
+
 def test_trailing_stop_and_exit_triggers():
     assert update_trailing_stop(D("95"), D("110"), D("2"), D("0.01")) == D("107.8")
     assert update_trailing_stop(D("108"), D("105"), D("2"), D("0.01")) == D("108")  # never moves down
