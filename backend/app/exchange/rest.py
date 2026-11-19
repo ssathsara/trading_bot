@@ -133,6 +133,10 @@ class PublicMarketClient(_BaseClient):
     async def book_ticker(self, symbol: str) -> dict:
         return await self._request("GET", "/api/v3/ticker/bookTicker", {"symbol": symbol})
 
+    async def book_tickers(self) -> list[dict]:
+        """Best bid/ask for every symbol in one request (weight 4)."""
+        return await self._request("GET", "/api/v3/ticker/bookTicker")
+
     async def order_book(self, symbol: str, limit: int = 20) -> dict:
         return await self._request("GET", "/api/v3/depth", {"symbol": symbol, "limit": limit})
 
@@ -189,15 +193,19 @@ class TestnetClient(_BaseClient):
 
     async def new_order(self, *, symbol: str, side: str, order_type: str, quantity: Decimal,
                         client_order_id: str, price: Decimal | None = None, time_in_force: str | None = None,
-                        test: bool = False) -> dict:
+                        stop_price: Decimal | None = None, test: bool = False) -> dict:
         params: dict[str, Any] = {
             "symbol": symbol, "side": side, "type": order_type,
             "quantity": format(quantity, "f"), "newClientOrderId": client_order_id,
             "newOrderRespType": "FULL",
         }
-        if order_type == "LIMIT":
+        if order_type in ("LIMIT", "STOP_LOSS_LIMIT"):
             params["price"] = format(price, "f")  # type: ignore[arg-type]
             params["timeInForce"] = time_in_force or "GTC"
+        if order_type in ("STOP_LOSS", "STOP_LOSS_LIMIT"):
+            if stop_price is None:
+                raise ValueError(f"{order_type} requires a stop price")
+            params["stopPrice"] = format(stop_price, "f")
         path = "/api/v3/order/test" if test else "/api/v3/order"
         return await self._signed("POST", path, params)
 

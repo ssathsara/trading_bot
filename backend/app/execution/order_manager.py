@@ -14,11 +14,16 @@ Safety properties
    race; the partial unique index on open positions is the DB-level backstop.
 5. **Unknown outcomes** (timeouts, 5xx) mark the order UNKNOWN and are
    reconciled; they are never treated as failed and never retried blindly.
+
+Purposes: ENTRY (buy), EXIT (bot-initiated sell) and STOP (a resting exchange-side
+stop-loss that protects a TESTNET position while the bot is offline; its fills are
+applied exactly like exit fills).
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from collections import defaultdict
 from collections.abc import Callable
@@ -42,6 +47,10 @@ ACTIVE = ("SUBMITTING", "UNKNOWN", "NEW", "PARTIALLY_FILLED", "PENDING_CANCEL")
 STATUS_MAP = {"EXPIRED_IN_MATCH": "EXPIRED", "PENDING_NEW": "NEW"}
 NOT_FOUND_GRACE = timedelta(seconds=90)
 ZERO = Decimal("0")
+SELL_PURPOSES = ("EXIT", "STOP")
+# A resting exchange stop can sit untouched for days; polling it every reconcile
+# tick (5 s) would just burn request weight.
+STOP_POLL_SECONDS = 15.0
 
 
 def new_client_order_id(mode: str) -> str:
@@ -67,9 +76,22 @@ class OrderManager:
         self.filters_lookup = filters_lookup
         self.fee_rate_lookup = fee_rate_lookup
         self._locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._stop_polled: dict[int, float] = {}
 
     def lock(self, symbol: str) -> asyncio.Lock:
         return self._locks[symbol]
+
+    def _request(self, o: TradingOrder) -> OrderRequest:
+        f = self.filters_lookup(o.symbol)
+        stop = (o.order_meta or {}).get("stop_price")
+        return OrderRequest(o.client_order_id, o.symbol, o.side, o.order_type, o.quantity, o.price,
+                            base_asset=f.base_asset if f else "", quote_asset=f.quote_asset if f else "USDT",
+                            stop_price=Decimal(stop) if stop else None)
+
+    def active_stops(self, s: Session, position_id: int) -> list[TradingOrder]:
+        return list(s.scalars(select(TradingOrder).where(
+            TradingOrder.position_id == position_id, TradingOrder.purpose == "STOP",
+            TradingOrder.status.in_(ACTIVE)).order_by(TradingOrder.id)))
 
     # ------------------------------------------------------------------ queries
     def has_active_entry(self, s: Session, symbol: str) -> bool:
@@ -91,8 +113,11 @@ class OrderManager:
     async def place(self, *, symbol: str, side: str, order_type: str, quantity: Decimal, purpose: str,
                     idempotency_key: str, expected_price: Decimal, price: Decimal | None = None,
                     position_id: int | None = None, signal_id: int | None = None, meta: dict | None = None,
-                    reason: str | None = None, timeout_seconds: int | None = None) -> int | None:
+                    reason: str | None = None, timeout_seconds: int | None = None,
+                    stop_price: Decimal | None = None) -> int | None:
         """Persist, submit and record an order. Returns the order id, or None if blocked as a duplicate."""
+        if stop_price is not None:
+            meta = {**(meta or {}), "stop_price": str(stop_price)}
         f = self.filters_lookup(symbol)
         async with self.lock(symbol):
             # ---- (A) persist intent atomically
@@ -108,6 +133,11 @@ class OrderManager:
                                 Position.status.in_(("OPEN", "CLOSING")))):
                             log_event(s, "orders", f"Entry for {symbol} blocked: position or entry order already exists",
                                       "WARNING", {"idempotency_key": idempotency_key}, category="order_rejected")
+                            return None
+                    elif purpose == "STOP":
+                        # Protective stop: the position stays OPEN (bot keeps managing it).
+                        pos = s.get(Position, position_id) if position_id else None
+                        if pos is None or pos.status != "OPEN" or self.active_stops(s, position_id):
                             return None
                     else:
                         pos = s.get(Position, position_id) if position_id else None
@@ -132,7 +162,7 @@ class OrderManager:
                     s.flush()
                     order_id, client_id = order.id, order.client_order_id
                     log_event(s, "orders", f"{self.mode} {purpose} {side} {order_type} {quantity} {symbol} submitted"
-                              + (f" @ {price}" if price else ""), "INFO",
+                              + (f" @ {price}" if price else "") + (f" stop {stop_price}" if stop_price else ""), "INFO",
                               {"client_order_id": client_id, "reason": reason, "simulated": self.mode == "PAPER"},
                               category="order_request")
             except IntegrityError:
@@ -141,7 +171,8 @@ class OrderManager:
 
             # ---- (B) submit (no DB transaction held)
             req = OrderRequest(client_id, symbol, side, order_type, quantity, price,
-                               base_asset=f.base_asset if f else "", quote_asset=f.quote_asset if f else "USDT")
+                               base_asset=f.base_asset if f else "", quote_asset=f.quote_asset if f else "USDT",
+                               stop_price=stop_price)
             try:
                 report = await self.adapter.submit(req)
             except Exception as exc:  # defensive: unexpected adapter failure => outcome unknown
@@ -217,7 +248,7 @@ class OrderManager:
                       + (f" @ {order.average_fill_price}" if order.average_fill_price else "")
                       + (f" ({report.error})" if report.error else ""), level,
                       {"order_id": order.id, "simulated": report.simulated}, category=cat)
-        if order.purpose == "EXIT":
+        if order.purpose in SELL_PURPOSES:
             self._after_exit(s, order)
         elif status in TERMINAL and order.position_id:
             pos = s.get(Position, order.position_id)
@@ -234,6 +265,12 @@ class OrderManager:
         f = self.filters_lookup(order.symbol)
         if pos.quantity <= 0:
             pf.close_position(s, pos, order.average_fill_price, reason)
+        elif order.purpose == "STOP":
+            # A protective stop that is still resting, was cancelled/replaced, or only partly
+            # filled leaves the position with the bot, which exits any remainder itself.
+            if order.filled_quantity > 0 and order.status in TERMINAL:
+                log_event(s, "orders", f"Exchange stop for {pos.symbol} filled {order.filled_quantity}; "
+                          f"{pos.quantity} remaining is managed by the bot", "WARNING", category="order_execution")
         elif order.status in TERMINAL:
             px = order.average_fill_price or pos.current_price or pos.average_entry_price
             is_dust = f is not None and (pos.quantity < max(f.min_qty, f.market_min_qty) or
@@ -255,15 +292,18 @@ class OrderManager:
     # ------------------------------------------------------------------ reconciliation
     async def reconcile(self) -> int:
         """Query every non-terminal order and apply its true state. Cancels expired limit orders."""
+        mono = time.monotonic()
         with session_scope() as s:
-            pending = [(o.id, o.symbol, o.side, o.order_type, o.quantity, o.price, o.client_order_id, o.expires_at, o.status)
-                       for o in s.scalars(select(TradingOrder).where(TradingOrder.execution_mode == self.mode,
-                                                                     TradingOrder.status.in_(ACTIVE)))]
+            pending = []
+            for o in s.scalars(select(TradingOrder).where(TradingOrder.execution_mode == self.mode,
+                                                          TradingOrder.status.in_(ACTIVE))):
+                if o.purpose == "STOP" and o.status == "NEW":
+                    if mono - self._stop_polled.get(o.id, float("-inf")) < STOP_POLL_SECONDS:
+                        continue
+                    self._stop_polled[o.id] = mono
+                pending.append((o.id, o.symbol, self._request(o), o.expires_at, o.status))
         now = datetime.now(timezone.utc)
-        for oid, symbol, side, otype, qty, price, cid, expires_at, status in pending:
-            f = self.filters_lookup(symbol)
-            req = OrderRequest(cid, symbol, side, otype, qty, price, base_asset=f.base_asset if f else "",
-                               quote_asset=f.quote_asset if f else "USDT")
+        for oid, symbol, req, expires_at, status in pending:
             async with self.lock(symbol):
                 try:
                     if expires_at and now > expires_at and status in ("NEW", "PARTIALLY_FILLED"):
@@ -273,11 +313,36 @@ class OrderManager:
                     else:
                         report = await self.adapter.query(req)
                 except Exception as exc:
-                    log.warning("reconcile query failed for %s: %s", cid, exc)
+                    log.warning("reconcile query failed for %s: %s", req.client_order_id, exc)
                     continue
                 with session_scope() as s:
-                    self.apply_report(s, oid, report)
+                    if self.apply_report(s, oid, report).status in TERMINAL:
+                        self._stop_polled.pop(oid, None)
         return len(pending)
+
+    async def cancel(self, order_id: int) -> str:
+        """Cancel an order on the venue and apply its final state (including any fills
+        that happened before the cancel landed). Returns the resulting status."""
+        with session_scope() as s:
+            o = s.get(TradingOrder, order_id)
+            if o is None:
+                return "NOT_FOUND"
+            if o.status in TERMINAL:
+                return o.status
+            symbol, req = o.symbol, self._request(o)
+        async with self.lock(symbol):
+            try:
+                report = await self.adapter.cancel(req)
+            except Exception as exc:  # defensive: outcome unknown
+                log.warning("cancel failed for %s: %s", req.client_order_id, exc)
+                return "UNKNOWN"
+            if report.status not in TERMINAL and report.status not in ("UNKNOWN", "NOT_FOUND"):
+                report.status = "CANCELED"
+            with session_scope() as s:
+                status = self.apply_report(s, order_id, report).status
+        if status in TERMINAL:
+            self._stop_polled.pop(order_id, None)
+        return status
 
     def restore_paper_orders(self) -> int:
         """After restart, re-register resting paper LIMIT orders with the simulator."""
@@ -287,9 +352,6 @@ class OrderManager:
         with session_scope() as s:
             for o in s.scalars(select(TradingOrder).where(TradingOrder.execution_mode == self.mode,
                                                           TradingOrder.status.in_(("NEW", "PARTIALLY_FILLED")))):
-                f = self.filters_lookup(o.symbol)
-                self.adapter.restore(OrderRequest(o.client_order_id, o.symbol, o.side, o.order_type, o.quantity, o.price,
-                                                  base_asset=f.base_asset if f else "", quote_asset=f.quote_asset if f else "USDT"),
-                                     o.filled_quantity, len(o.fills))
+                self.adapter.restore(self._request(o), o.filled_quantity, len(o.fills))
                 n += 1
         return n

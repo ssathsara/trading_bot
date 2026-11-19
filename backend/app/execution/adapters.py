@@ -24,11 +24,12 @@ class OrderRequest:
     client_order_id: str
     symbol: str
     side: str  # BUY | SELL
-    order_type: str  # MARKET | LIMIT
+    order_type: str  # MARKET | LIMIT | STOP_LOSS | STOP_LOSS_LIMIT (stops: testnet only)
     quantity: Decimal
     price: Decimal | None = None
     base_asset: str = ""
     quote_asset: str = "USDT"
+    stop_price: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -96,6 +97,10 @@ class PaperExecutionAdapter:
         with self._lock:
             if req.client_order_id in self._orders:  # idempotent resubmission
                 return self._report(self._orders[req.client_order_id])
+        if req.order_type not in ("MARKET", "LIMIT"):
+            # Exchange-side stops protect real venue positions while the bot is offline;
+            # a paper position only exists while the bot runs, so there is nothing to simulate.
+            return ExecutionReport("REJECTED", None, error=f"paper: {req.order_type} orders not simulated", simulated=True)
         try:
             book = await self.depth_provider(req.symbol)
         except Exception as exc:
@@ -229,7 +234,8 @@ class TestnetExecutionAdapter:
         try:
             resp = await self.client.new_order(symbol=req.symbol, side=req.side, order_type=req.order_type,
                                                quantity=req.quantity, client_order_id=req.client_order_id,
-                                               price=req.price, time_in_force="GTC" if req.order_type == "LIMIT" else None)
+                                               price=req.price, stop_price=req.stop_price,
+                                               time_in_force="GTC" if req.order_type in ("LIMIT", "STOP_LOSS_LIMIT") else None)
         except BinanceNetworkError as exc:
             return ExecutionReport("UNKNOWN", error=f"submission outcome unknown: {exc}")
         except BinanceRateLimitError as exc:

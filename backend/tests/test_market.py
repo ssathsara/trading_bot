@@ -78,6 +78,70 @@ def test_top_n_limit_and_volume_order():
     assert all(a.quote_volume >= b.quote_volume for a, b in zip(selected, selected[1:]))
 
 
+def test_all_pairs_mode_and_liquidity_floor():
+    symbols = [exchange_symbol(f"C{i}USDT", f"C{i}") for i in range(1, 51)]
+    tickers = [_ticker(f"C{i}USDT", i * 100_000) for i in range(1, 51)]  # 0.1M .. 5M
+    selected, _ = rank_pairs(symbols, tickers, top_n=0)
+    assert len(selected) == 50 and [c.rank for c in selected] == list(range(1, 51))
+    selected, rejected = rank_pairs(symbols, tickers, top_n=0, min_quote_volume=D("1000000"))
+    assert len(selected) == 41 and all(c.quote_volume >= D("1000000") for c in selected)
+    assert {c.symbol for c in rejected} == {f"C{i}USDT" for i in range(1, 10)}
+    assert rejected[0].exclusion_reason.startswith("low liquidity")
+
+
+async def test_sharded_stream_splits_connections_and_aggregates_status():
+    from app.exchange.websocket import ShardedStreamManager
+
+    made = []
+
+    class FakeShard:
+        def __init__(self, url, on_event, on_status, **kw):
+            self.on_status, self.include_trades, self._streams = on_status, True, []
+            self.connected, self.reconnects, self.invalid_messages = False, 1, 0
+            self.started = self.stopped = False
+            made.append(self)
+
+        def set_subscriptions(self, symbols, tfs):
+            self.symbols, self._streams = symbols, [f"{s}@x" for s in symbols]
+
+        def is_healthy(self, max_silence=None):
+            return self.connected
+
+        def start(self):
+            self.started = True
+
+        async def stop(self):
+            self.stopped = True
+
+    statuses = []
+
+    async def on_status(st, info):
+        statuses.append(st)
+
+    m = ShardedStreamManager("wss://x", None, on_status, max_streams=50, factory=FakeShard)
+    syms = [f"S{i:03d}USDT" for i in range(120)]
+    m.set_subscriptions(syms, ["15m", "1h", "4h"])  # 5 streams/symbol (no trades) => 10 symbols/shard
+    assert len(m.shards) == 12 and all(not s.include_trades for s in m.shards)
+    assert sorted(x for s in m.shards for x in s.symbols) == sorted(syms)
+    task = m.start()
+    await asyncio.sleep(0)
+    assert all(s.started for s in m.shards) and m.reconnects == 12 and not m.connected
+    for i, s in enumerate(m.shards):
+        s.connected = True
+        await s.on_status("connected", {})
+    assert m.connected and m.is_healthy() and statuses[-1] == "connected"
+    await m.shards[3].on_status("reconnecting", {})
+    assert statuses[-1] == "reconnecting"  # one bad shard => aggregate is degraded
+    await m.shards[3].on_status("connected", {})
+    assert statuses[-1] == "connected"
+    # universe shrinks => surplus connections closed; small universe re-enables trades
+    m.set_subscriptions(syms[:5], ["15m", "1h", "4h"])
+    await asyncio.sleep(0)
+    assert len(m.shards) == 1 and m.shards[0].include_trades and made[5].stopped
+    task.cancel()
+    await m.stop()
+
+
 def test_token_classifiers():
     assert is_stablecoin("USDT") and is_stablecoin("USD1") and not is_stablecoin("BTC")
     assert is_leveraged_token("ETHDOWN") and is_leveraged_token("BTCUP") and not is_leveraged_token("JUP")

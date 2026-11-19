@@ -20,6 +20,12 @@ from typing import Any
 log = logging.getLogger(__name__)
 CHANNELS = ("market", "dashboard", "trading")
 REDIS_PREFIX = "tradingbot:"
+# Outgoing Redis events are queued and sent by ONE task over one connection. A task
+# per publish used one pooled connection each, so bursts (stream reconnects, universe
+# refreshes) exhausted the pool with "Too many connections". Events are UI updates;
+# when the queue is full the oldest are dropped instead of stalling trading.
+REDIS_OUTBOX_MAX = 5000
+REDIS_BATCH_MAX = 500
 
 
 def _default(o: Any) -> Any:
@@ -43,6 +49,9 @@ class EventBus:
         self._lock = threading.Lock()
         self._redis = None
         self._redis_task: asyncio.Task | None = None
+        self._outbox: asyncio.Queue[tuple[str, str]] | None = None
+        self._sender_task: asyncio.Task | None = None
+        self.dropped_events = 0
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
@@ -53,8 +62,46 @@ class EventBus:
 
         self._redis = aioredis.from_url(url, decode_responses=True)
         await self._redis.ping()
+        self._outbox = asyncio.Queue(maxsize=REDIS_OUTBOX_MAX)
+        self._sender_task = asyncio.create_task(self._sender(), name="redis-publisher")
         if relay:
             self._redis_task = asyncio.create_task(self._relay())
+
+    def _enqueue(self, channel: str, payload: str) -> None:
+        """Runs on the event loop thread."""
+        q = self._outbox
+        if q is None:
+            return
+        if q.full():
+            try:
+                q.get_nowait()
+                self.dropped_events += 1
+            except asyncio.QueueEmpty:
+                pass
+        q.put_nowait((channel, payload))
+
+    async def _sender(self) -> None:
+        assert self._redis is not None and self._outbox is not None
+        q = self._outbox
+        backoff = 1.0
+        while True:
+            batch = [await q.get()]
+            while len(batch) < REDIS_BATCH_MAX and not q.empty():
+                batch.append(q.get_nowait())
+            try:
+                async with self._redis.pipeline(transaction=False) as pipe:
+                    for channel, payload in batch:
+                        pipe.publish(REDIS_PREFIX + channel, payload)
+                    await pipe.execute()
+                backoff = 1.0
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # pragma: no cover - network dependent
+                # This batch is lost (UI events only); never let the sender die.
+                self.dropped_events += len(batch)
+                log.warning("redis publish failed (%s); %d event(s) dropped, retrying in %.0fs", exc, len(batch), backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30)
 
     async def _relay(self) -> None:
         assert self._redis is not None
@@ -100,29 +147,22 @@ class EventBus:
         loop = self._loop
         if loop is None or loop.is_closed():
             return
-        if self._redis is not None:
-            coro = self._redis.publish(REDIS_PREFIX + channel, payload)
-            try:
-                running = asyncio.get_running_loop()
-            except RuntimeError:
-                running = None
-            if running is loop:
-                loop.create_task(coro)
-            else:
-                asyncio.run_coroutine_threadsafe(coro, loop)
-            return
+        target = self._enqueue if self._redis is not None else self._fanout
         try:
             running = asyncio.get_running_loop()
         except RuntimeError:
             running = None
         if running is loop:
-            self._fanout(channel, payload)
+            target(channel, payload)
         else:
-            loop.call_soon_threadsafe(self._fanout, channel, payload)
+            loop.call_soon_threadsafe(target, channel, payload)
 
     async def close(self) -> None:
-        if self._redis_task:
-            self._redis_task.cancel()
+        for task in (self._redis_task, self._sender_task):
+            if task:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self._redis_task = self._sender_task = None
         if self._redis is not None:
             await self._redis.aclose()
 

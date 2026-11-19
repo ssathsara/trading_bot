@@ -291,3 +291,114 @@ class MarketStreamManager:
                     await self.on_event(ev)
                 except Exception:
                     log.exception("market event handler failed")
+
+
+_STATUS_SEVERITY = {"connected": 0, "init": 1, "reconnecting": 2, "disconnected": 3, "stale": 4, "error": 5}
+
+
+class ShardedStreamManager:
+    """Spreads many symbols over several combined-stream connections.
+
+    Binance allows at most 1024 streams per connection (and very long URLs are
+    fragile), so each shard carries at most ``max_streams`` streams. Symbols are
+    sharded alphabetically so a re-ranking of the universe rarely moves a symbol
+    to another connection. Exposes the same interface as ``MarketStreamManager``;
+    the reported status is the worst status of any shard.
+    """
+
+    # The per-trade stream only refines the "last price" (the 1s ticker also has it)
+    # and is by far the busiest stream; only subscribe to it for small universes.
+    TRADES_MAX_SYMBOLS = 20
+
+    def __init__(self, base_url: str, on_event: Handler, on_status: StatusHandler | None = None, *,
+                 max_streams: int = 200, factory: Callable[..., MarketStreamManager] | None = None,
+                 **child_kwargs: Any) -> None:
+        self.base_url = base_url
+        self.on_event = on_event
+        self.on_status = on_status
+        self.max_streams = max_streams
+        self._factory = factory or MarketStreamManager
+        self._child_kwargs = child_kwargs
+        self.shards: list[MarketStreamManager] = []
+        self._shard_status: list[str] = []
+        self._reported = "init"
+        self._started = False
+        self._task: asyncio.Task | None = None
+
+    # ---- aggregate interface
+    @property
+    def connected(self) -> bool:
+        return bool(self.shards) and all(s.connected for s in self.shards)
+
+    @property
+    def reconnects(self) -> int:
+        return sum(s.reconnects for s in self.shards)
+
+    @property
+    def invalid_messages(self) -> int:
+        return sum(s.invalid_messages for s in self.shards)
+
+    def is_healthy(self, max_silence: float | None = None) -> bool:
+        return bool(self.shards) and all(s.is_healthy(max_silence) for s in self.shards)
+
+    def _dispatch(self, ev: MarketEvent) -> Awaitable[None]:
+        return self.on_event(ev)  # resolved at call time so on_event can be rebound
+
+    def _make_status_handler(self, idx: int) -> StatusHandler:
+        async def handler(status: str, info: dict) -> None:
+            if idx >= len(self._shard_status):
+                return
+            self._shard_status[idx] = status
+            agg = max(self._shard_status, key=lambda st: _STATUS_SEVERITY.get(st, 5))
+            if agg != self._reported:
+                self._reported = agg
+                if self.on_status:
+                    await self.on_status(agg, {**info, "shard": idx, "shards": len(self.shards)})
+        return handler
+
+    def set_subscriptions(self, symbols: list[str], timeframes: list[str]) -> None:
+        include_trades = len(symbols) <= self.TRADES_MAX_SYMBOLS
+        per_symbol = 2 + len(timeframes) + (1 if include_trades else 0)
+        chunk = max(1, self.max_streams // per_symbol)
+        ordered = sorted(dict.fromkeys(symbols))
+        groups = [ordered[i:i + chunk] for i in range(0, len(ordered), chunk)]
+        for idx, group in enumerate(groups):
+            if idx < len(self.shards):
+                shard = self.shards[idx]
+            else:
+                shard = self._factory(self.base_url, self._dispatch, self._make_status_handler(idx),
+                                      **self._child_kwargs)
+                self.shards.append(shard)
+                self._shard_status.append("init")
+                if self._started:
+                    shard.start()
+            if shard.include_trades != include_trades:
+                shard.include_trades = include_trades
+                shard._streams = []  # force set_subscriptions to restart with the new stream set
+            shard.set_subscriptions(group, timeframes)
+        for shard in self.shards[len(groups):]:  # universe shrank: close surplus connections
+            asyncio.get_running_loop().create_task(shard.stop())
+        del self.shards[len(groups):]
+        del self._shard_status[len(groups):]
+
+    async def _run(self) -> None:
+        self._started = True
+        for shard in self.shards:
+            shard.start()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.gather(*(s.stop() for s in self.shards), return_exceptions=True)
+
+    def start(self) -> asyncio.Task:
+        self._task = asyncio.create_task(self._run(), name="market-ws-shards")
+        return self._task
+
+    async def stop(self) -> None:
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+        await asyncio.gather(*(s.stop() for s in self.shards), return_exceptions=True)

@@ -99,10 +99,11 @@ export default function SettingsPage() {
           <CardContent>
             {market && execution && (
               <div className="grid grid-cols-2 gap-3 md:grid-cols-3">
-                {field(market, setMarket, "top_n", "Top N pairs")}
+                {field(market, setMarket, "top_n", "Max pairs (0 = all)")}
+                {field(market, setMarket, "min_quote_volume_usdt", "Min 24h volume (USDT, 0 = any)")}
                 {field(market, setMarket, "ranking_refresh_minutes", "Ranking refresh (min)")}
                 {field(market, setMarket, "min_history_candles", "Min history candles")}
-                <label className="col-span-full text-xs text-muted">Selected cryptocurrencies (comma-separated; empty = all top-N)
+                <label className="col-span-full text-xs text-muted">Selected cryptocurrencies (comma-separated; empty = every pair in the universe)
                   <Input className="mt-1" value={(market.selected_symbols ?? []).join(",")}
                     onChange={(e) => setMarket({ ...market, selected_symbols: e.target.value.toUpperCase().split(",").map((x: string) => x.trim()).filter(Boolean) })} /></label>
                 <label className="col-span-full text-xs text-muted">Excluded symbols
@@ -115,8 +116,11 @@ export default function SettingsPage() {
                 {field(execution, setExecution, "paper_fee_rate", "Paper fee rate")}
                 {field(execution, setExecution, "paper_slippage_bps", "Paper slippage (bps)")}
                 {field(execution, setExecution, "estimated_fee_rate", "Risk est. fee rate")}
+                {field(execution, setExecution, "exchange_stop_buffer_pct", "Exchange stop buffer (%)")}
                 <label className="col-span-full flex items-center gap-2 text-sm"><Switch checked={execution.allow_market_orders} label="Allow market orders"
                   onChange={(v) => setExecution({ ...execution, allow_market_orders: v })} />Allow market orders</label>
+                <label className="col-span-full flex items-center gap-2 text-sm"><Switch checked={execution.exchange_stop_enabled ?? true} label="Exchange-side stop-loss"
+                  onChange={(v) => setExecution({ ...execution, exchange_stop_enabled: v })} />Exchange-side stop-loss (testnet: protects open positions while the bot is offline)</label>
               </div>
             )}
           </CardContent>

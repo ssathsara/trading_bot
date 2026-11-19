@@ -49,6 +49,9 @@ class FakePublic:
             rows = [r for r in rows if r[0] <= end_ms]
         return rows[-limit:]
 
+    async def book_tickers(self):
+        return []
+
     async def order_book(self, symbol, limit=20):
         q = price_cache.get(symbol)
         return {"bids": [[str(q.bid), "50"]], "asks": [[str(q.ask), "50"]]}
@@ -178,6 +181,93 @@ async def test_stale_data_blocks_entries(configured):
             assert "stale" in ev.description
     finally:
         await eng.stop()
+
+
+async def test_candle_integrity_repairs_holes_after_stream_outage(configured):
+    """Regression: a stream outage left a hole in the middle of the series once live
+    candles resumed; the reconnect-time backfill only looked at the newest candle, so
+    every symbol stayed blocked as 'data not usable' forever."""
+    from app.models import MarketCandle, SystemLog
+
+    eng = await make_engine()
+    await eng.start()
+    try:
+        tf = get_strategy_entry_tf()
+        with session_scope() as s:
+            times = list(s.scalars(select(MarketCandle.open_time).where(
+                MarketCandle.symbol == "BTCUSDT", MarketCandle.timeframe == tf)
+                .order_by(MarketCandle.open_time.desc()).limit(12)))
+            hole = times[2:9]  # 7 candles missing in the middle; the newest ones are present
+            s.execute(MarketCandle.__table__.delete().where(MarketCandle.symbol == "BTCUSDT",
+                                                            MarketCandle.timeframe == tf,
+                                                            MarketCandle.open_time.in_(hole)))
+        _, issues, _ = eng.build_frames("BTCUSDT")
+        assert any("missing" in i for i in issues), issues
+
+        calls = []
+        orig = eng.public.klines
+
+        async def counting(*a, **kw):
+            calls.append(a)
+            return await orig(*a, **kw)
+
+        eng.public.klines = counting
+        await eng.candle_integrity_tick()
+        _, issues, _ = eng.build_frames("BTCUSDT")
+        assert issues == []
+        assert calls, "the hole must be repaired over REST"
+        with session_scope() as s:
+            assert s.scalar(select(SystemLog).where(SystemLog.message.like("BTCUSDT: repaired missing candles%")))
+
+        calls.clear()
+        await eng.candle_integrity_tick()  # healthy data => no REST traffic
+        assert calls == []
+    finally:
+        await eng.stop()
+
+
+async def test_housekeeping_prunes_only_old_unactioned_holds(configured):
+    from datetime import datetime, timedelta, timezone
+
+    eng = await make_engine()
+    old = datetime.now(timezone.utc) - timedelta(days=engine_mod.SIGNAL_RETENTION_DAYS + 1)
+    with session_scope() as s:
+        keep_new = AISignal(symbol="BTCUSDT", signal="HOLD", confidence_score=D("0"), strategy_name="t", reason="r",
+                            action_status="NONE", indicator_snapshot={})
+        drop = AISignal(symbol="BTCUSDT", signal="HOLD", confidence_score=D("0"), strategy_name="t", reason="r",
+                        action_status="NONE", indicator_snapshot={}, created_at=old)
+        keep_buy = AISignal(symbol="BTCUSDT", signal="BUY", confidence_score=D("70"), strategy_name="t", reason="r",
+                            action_status="REJECTED", indicator_snapshot={}, created_at=old)
+        s.add_all([keep_new, drop, keep_buy])
+        s.flush()
+        ids = (keep_new.id, drop.id, keep_buy.id)
+    await eng.housekeeping_tick()
+    with session_scope() as s:
+        left = set(s.scalars(select(AISignal.id)))
+    assert ids[0] in left and ids[2] in left and ids[1] not in left
+
+
+async def test_quiet_order_book_is_fresh_only_while_stream_is_healthy(configured):
+    eng = await make_engine()
+    rs = RiskSettings()
+    await eng.on_market_event(quote("BTCUSDT", "99.99", "100.01"))
+    q = price_cache.get("BTCUSDT")
+    assert not eng._quote_stale(q, rs)
+    q.updated_at -= 120  # unchanged book for 2 minutes, connection alive
+    assert not eng._quote_stale(q, rs)
+    eng.stream.is_healthy = lambda max_silence=None: False  # connection lost => stale at once
+    assert eng._quote_stale(q, rs)
+    eng.stream.is_healthy = lambda max_silence=None: True
+    q.updated_at -= engine_mod.QUIET_BOOK_MAX_AGE_S  # beyond the quiet-book bound
+    assert eng._quote_stale(q, rs)
+    assert eng._quote_stale(None, rs)
+
+
+def get_strategy_entry_tf() -> str:
+    from app.settings_store import get_strategy
+
+    with session_scope() as s:
+        return get_strategy(s).entry_timeframe
 
 
 async def test_hard_limit_halts_trading(configured):

@@ -19,8 +19,9 @@ import os
 import socket
 import time
 import uuid
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 
 from sqlalchemy import func, select
 
@@ -31,10 +32,10 @@ from app.audit import log_event, risk_event
 from app.config import ExecutionMode, Settings
 from app.db import numeric, session_scope
 from app.events import bus
-from app.exchange.filters import SymbolFilters
+from app.exchange.filters import SymbolFilters, round_step
 from app.exchange.rest import BinanceError, PublicMarketClient, TestnetClient
-from app.exchange.websocket import BookTickerEvent, KlineEvent, MarketStreamManager, TickerEvent, TradeEvent
-from app.execution.adapters import PaperExecutionAdapter, TestnetExecutionAdapter
+from app.exchange.websocket import BookTickerEvent, KlineEvent, MarketStreamManager, ShardedStreamManager, TickerEvent, TradeEvent
+from app.execution.adapters import TERMINAL, PaperExecutionAdapter, TestnetExecutionAdapter
 from app.execution.order_manager import ACTIVE, OrderManager
 from app.market import candles as cd
 from app.market.discovery import rank_pairs
@@ -42,13 +43,22 @@ from app.market.price_cache import price_cache
 from app.models import AISignal, MarketCandle, MarketIndicator, Position, SystemSetting, TradingOrder, TradingPair
 from app.portfolio import service as pf
 from app.risk.engine import AccountSnapshot, EntryRequest, check_hard_limits, evaluate_entry, exit_trigger, update_trailing_stop
-from app.settings_store import (get_control, get_execution, get_market, get_risk, get_strategy)
+from app.settings_store import get_control, get_execution, get_market, get_risk, get_strategy
 
 log = logging.getLogger("worker")
 LEASE_KEY = "worker.lease"
 STATUS_KEY = "worker.status"
 CLOSE_REQUESTS_KEY = "commands.close_position"
 LEASE_TTL = 30
+INTEGRITY_WINDOW = 300  # candles per timeframe kept hole-free (= what analysis loads)
+BACKFILL_CONCURRENCY = 4
+QUIET_BOOK_MAX_AGE_S = 300  # longest a quiet-but-connected order book is trusted
+SIGNAL_RETENTION_DAYS = 14  # HOLD signals that led to no action are pruned after this
+# Exchange-side protective stops (TESTNET)
+STOP_REPLACE_STEP = Decimal("0.0025")  # move the exchange stop only once the bot's stop rose 0.25%
+STOP_LIMIT_OFFSET = Decimal("0.02")  # STOP_LOSS_LIMIT fallback: limit price 2% under the trigger
+STOP_RETRY_SECONDS = 300  # after a rejected stop placement, wait before trying again
+HUNDRED = Decimal("100")
 
 
 def _iso(ms: int) -> str:
@@ -57,7 +67,7 @@ def _iso(ms: int) -> str:
 
 class TradingEngine:
     def __init__(self, settings: Settings, public: PublicMarketClient | None = None,
-                 stream: MarketStreamManager | None = None) -> None:
+                 stream: MarketStreamManager | ShardedStreamManager | None = None) -> None:
         self.settings = settings
         self.public = public or PublicMarketClient(settings.market_data_rest_url)
         self.testnet: TestnetClient | None = None
@@ -65,7 +75,7 @@ class TradingEngine:
             self.testnet = TestnetClient(settings.binance_testnet_rest_url,
                                          settings.binance_testnet_api_key.get_secret_value(),
                                          settings.binance_testnet_api_secret.get_secret_value())
-        self.stream = stream or MarketStreamManager(settings.market_data_ws_url, self.on_market_event, self.on_stream_status)
+        self.stream = stream or ShardedStreamManager(settings.market_data_ws_url, self.on_market_event, self.on_stream_status)
         self.filters: dict[str, SymbolFilters] = {}
         self.testnet_symbols: set[str] | None = None
         self.top_symbols: list[str] = []
@@ -81,9 +91,15 @@ class TradingEngine:
         self.stale_reported: set[str] = set()
         self._tasks: list[asyncio.Task] = []
         self._ticker_pub: dict[str, float] = {}
+        self._repair_attempts: dict[tuple[str, str, int], tuple[int, float]] = {}
         self._analysis_queue: asyncio.Queue[str] = asyncio.Queue()
         self._queued: set[str] = set()
         self._position_check = asyncio.Event()
+        # Serialises exit placement and exchange-stop maintenance per position, so a stop
+        # can never be (re)placed between cancelling it and submitting the exit.
+        self._pos_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._stop_retry_at: dict[int, float] = {}
+        self._stop_unsupported: set[str] = set()
         self._stopping = False
         # Set when another instance takes over the lease; the host process should
         # stop this engine and (optionally) start a fresh one that re-contends.
@@ -98,6 +114,18 @@ class TradingEngine:
         else:
             adapter = self.paper
         return OrderManager(adapter, mode, self.filters.get, self._fee_asset_rate)
+
+    def _quote_stale(self, q, rs) -> bool:
+        """Binance pushes bookTicker only when the best bid/ask CHANGES, so a quiet market
+        can be silent for minutes while the cached quote is still exact. A quote counts as
+        fresh if it is recent, or if the stream connection is verifiably alive (heartbeat)
+        and the quote is not older than QUIET_BOOK_MAX_AGE_S."""
+        if q is None:
+            return True
+        age = q.age()
+        if age <= rs.stale_data_seconds:
+            return False
+        return not (self.stream.is_healthy() and age <= QUIET_BOOK_MAX_AGE_S)
 
     def _fee_asset_rate(self, asset: str) -> Decimal | None:
         return price_cache.price(f"{asset}USDT")
@@ -159,11 +187,14 @@ class TradingEngine:
         self._tasks = [
             self.stream.start(),
             asyncio.create_task(self._loop(self.reconcile_tick, 5), name="reconcile"),
+            asyncio.create_task(self._loop(self.protect_tick, 5), name="exchange-stops"),
             asyncio.create_task(self._loop(self.risk_tick, 10), name="risk"),
             asyncio.create_task(self._loop(self.snapshot_tick, 60), name="snapshot"),
             asyncio.create_task(self._loop(self.lease_tick, 10), name="lease"),
             asyncio.create_task(self._loop(self.control_tick, 3), name="control"),
             asyncio.create_task(self._loop(self.discovery_tick, 60), name="discovery"),
+            asyncio.create_task(self._loop(self.candle_integrity_tick, 60), name="candle-integrity"),
+            asyncio.create_task(self._loop(self.housekeeping_tick, 3600), name="housekeeping"),
             asyncio.create_task(self._position_loop(), name="positions"),
             asyncio.create_task(self._analysis_worker(), name="analysis"),
         ]
@@ -224,19 +255,24 @@ class TradingEngine:
         tfs = sorted({strat.trend_timeframe, strat.setup_timeframe, strat.entry_timeframe}, key=lambda t: cd.TIMEFRAMES[t])
         # Rank without history first, then verify history for the leading candidates.
         groups = set(mk.excluded_permission_groups)
-        prelim, _ = rank_pairs(self._exchange_symbols, tickers, top_n=mk.top_n + 8, excluded=set(mk.excluded_symbols),
-                               testnet_symbols=self.testnet_symbols, excluded_permission_groups=groups)
-        history_ok: dict[str, bool] = {}
-        for c in prelim:
-            ok = True
-            for tf in tfs:
-                got = await self.backfill(c.symbol, tf, mk.history_candles)
-                if got < mk.min_history_candles:
-                    ok = False
-            history_ok[c.symbol] = ok
-        selected, rejected = rank_pairs(self._exchange_symbols, tickers, top_n=mk.top_n, excluded=set(mk.excluded_symbols),
-                                        testnet_symbols=self.testnet_symbols, history_ok=history_ok,
-                                        excluded_permission_groups=groups)
+        common = dict(excluded=set(mk.excluded_symbols), testnet_symbols=self.testnet_symbols,
+                      excluded_permission_groups=groups, min_quote_volume=mk.min_quote_volume_usdt)
+        prelim, _ = rank_pairs(self._exchange_symbols, tickers, top_n=mk.top_n + 8 if mk.top_n > 0 else 0, **common)
+        # Load history concurrently, but bounded: the public REST limit is 6000 weight/min
+        # and the initial load for a few hundred pairs is ~1000 kline requests.
+        sem = asyncio.Semaphore(BACKFILL_CONCURRENCY)
+
+        async def history_for(symbol: str) -> bool:
+            async with sem:
+                ok = True
+                for tf in tfs:
+                    if await self.backfill(symbol, tf, mk.history_candles) < mk.min_history_candles:
+                        ok = False
+                return ok
+
+        results = await asyncio.gather(*(history_for(c.symbol) for c in prelim))
+        history_ok = {c.symbol: ok for c, ok in zip(prelim, results)}
+        selected, rejected = rank_pairs(self._exchange_symbols, tickers, top_n=mk.top_n, history_ok=history_ok, **common)
         with session_scope() as s:
             ranked = {c.symbol for c in selected}
             for row in s.scalars(select(TradingPair)):
@@ -255,12 +291,15 @@ class TradingEngine:
                 if self.mode == "TESTNET" and not c.testnet_supported:
                     row.exclusion_reason = "unavailable on Spot Testnet (paper trading only)"
             unavailable = [c.symbol for c in selected if not c.testnet_supported]
-            log_event(s, "discovery", f"Top {len(selected)} pairs: {', '.join(c.symbol for c in selected)}"
+            names = [c.symbol for c in selected]
+            shown = ", ".join(names[:20]) + (f" and {len(names) - 20} more" if len(names) > 20 else "")
+            log_event(s, "discovery", f"Trading universe: {len(selected)} pairs: {shown}"
                       + (f"; not on testnet: {', '.join(unavailable)}" if unavailable else ""), category="discovery",
                       meta={"rejected_sample": [(c.symbol, c.exclusion_reason) for c in rejected[:15]]})
         self.top_symbols = [c.symbol for c in selected]
         self.last_discovery_at = time.time()
         self.stream.set_subscriptions(self.watch_symbols(), tfs)
+        await self.seed_quotes()
         bus.publish("market", "universe", {"symbols": self.top_symbols})
 
     def watch_symbols(self) -> list[str]:
@@ -269,30 +308,96 @@ class TradingEngine:
             held = [p.symbol for p in pf.open_positions(s, self.mode)]
         return list(dict.fromkeys(self.top_symbols + held))
 
-    async def backfill(self, symbol: str, tf: str, n: int) -> int:
-        """Ensure the most recent ``n`` closed candles are stored; returns how many are stored now."""
-        with session_scope() as s:
-            last = s.scalar(select(func.max(MarketCandle.open_time)).where(MarketCandle.symbol == symbol,
-                                                                           MarketCandle.timeframe == tf))
-            have = s.scalar(select(func.count()).select_from(MarketCandle).where(MarketCandle.symbol == symbol,
-                                                                                MarketCandle.timeframe == tf)) or 0
+    # A closed candle is only "expected" in the DB this long after it closed, so the
+    # integrity check does not race the WebSocket's own close event.
+    CANDLE_GRACE_MS = 15_000
+    # Retry a deficit that REST could not repair (e.g. a genuine exchange gap or a newly
+    # listed pair) at most this often.
+    REPAIR_RETRY_S = 900
+
+    def _window_bounds(self, tf: str, n: int, now_ms: int) -> tuple[int, int]:
+        """Open times (ms) of the oldest and newest of the latest ``n`` expected closed candles."""
         dur = cd.TIMEFRAMES[tf]
-        if last is not None and have >= n:
-            missing = int((time.time() * 1000 - cd.dt_to_ms(last)) // dur)
-            if missing <= 1:
-                return have
-            fetch = min(missing + 2, 1000)
-        else:
-            fetch = n
+        newest = ((now_ms - self.CANDLE_GRACE_MS) // dur) * dur - dur
+        return newest - (n - 1) * dur, newest
+
+    def _window_counts(self, symbols: list[str], tf: str, n: int) -> dict[str, int]:
+        """Stored candles per symbol inside the expected window - one query for all symbols."""
+        oldest, newest = self._window_bounds(tf, n, int(time.time() * 1000))
+        with session_scope() as s:
+            rows = s.execute(select(MarketCandle.symbol, func.count()).where(
+                MarketCandle.symbol.in_(symbols), MarketCandle.timeframe == tf,
+                MarketCandle.open_time >= cd.ms_to_dt(oldest), MarketCandle.open_time <= cd.ms_to_dt(newest),
+            ).group_by(MarketCandle.symbol)).all()
+        counts = {sym: 0 for sym in symbols}
+        counts.update({sym: c for sym, c in rows})
+        return counts
+
+    def _total_candles(self, symbol: str, tf: str) -> int:
+        with session_scope() as s:
+            return s.scalar(select(func.count()).select_from(MarketCandle).where(
+                MarketCandle.symbol == symbol, MarketCandle.timeframe == tf)) or 0
+
+    async def _repair(self, symbol: str, tf: str, n: int) -> int:
+        """Fill any hole in the latest ``n`` closed candles from REST. Returns rows inserted."""
+        deficit = n - self._window_counts([symbol], tf, n)[symbol]
+        if deficit <= 0:
+            return 0
+        attempt_key = (symbol, tf, n)
+        prev = self._repair_attempts.get(attempt_key)
+        if prev and prev[0] == deficit and time.time() - prev[1] < self.REPAIR_RETRY_S:
+            return 0  # REST could not fill this deficit last time either; don't hammer the API
         try:
-            candles = await cd.fetch_closed_candles(self.public, symbol, tf, fetch)
+            candles = await cd.fetch_closed_candles(self.public, symbol, tf, n)
         except BinanceError as exc:
             log.warning("backfill %s %s failed: %s", symbol, tf, exc)
-            return have
+            return 0
         with session_scope() as s:
-            cd.store_candles(s, symbol, tf, candles)
-            return s.scalar(select(func.count()).select_from(MarketCandle).where(MarketCandle.symbol == symbol,
-                                                                                MarketCandle.timeframe == tf)) or 0
+            inserted = cd.store_candles(s, symbol, tf, candles)
+        self._repair_attempts[attempt_key] = (n - self._window_counts([symbol], tf, n)[symbol], time.time())
+        return inserted
+
+    async def backfill(self, symbol: str, tf: str, n: int) -> int:
+        """Ensure the most recent ``n`` closed candles are all stored - including holes in the
+        middle of the series (e.g. a stream outage after which live candles resumed).
+        Returns how many candles are stored in total now."""
+        await self._repair(symbol, tf, n)
+        return self._total_candles(symbol, tf)
+
+    async def candle_integrity_tick(self) -> None:
+        """Periodically verify recent candle history and repair it over REST.
+
+        The WebSocket can stay "connected" while kline events stop arriving, and a
+        reconnect-time backfill runs too early to see candles that close later. Without
+        this, a single outage leaves a permanent hole that blocks every entry as
+        "data not usable"."""
+        with session_scope() as s:
+            strat = get_strategy(s)
+        await self.seed_quotes()  # also keeps quiet (rarely changing) order books priced
+        symbols = self.watch_symbols()
+        if not symbols:
+            return
+        repaired: dict[str, list[tuple[str, int]]] = {}
+        sem = asyncio.Semaphore(BACKFILL_CONCURRENCY)
+
+        async def fix(sym: str, tf: str) -> None:
+            async with sem:
+                if k := await self._repair(sym, tf, INTEGRITY_WINDOW):
+                    repaired.setdefault(sym, []).append((tf, k))
+
+        jobs = []
+        for tf in {strat.trend_timeframe, strat.setup_timeframe, strat.entry_timeframe}:
+            counts = self._window_counts(symbols, tf, INTEGRITY_WINDOW)
+            jobs += [fix(sym, tf) for sym, c in counts.items() if c < INTEGRITY_WINDOW]
+        await asyncio.gather(*jobs)
+        for sym, parts in repaired.items():
+            # A single just-closed candle arriving via REST instead of the stream (quiet
+            # symbols' close events can lag) is routine; only real holes are worth a warning.
+            if any(k > 1 for _, k in parts):
+                with session_scope() as s:
+                    log_event(s, "market", f"{sym}: repaired missing candles from REST "
+                              f"({', '.join(f'{tf}: {k}' for tf, k in parts)})", "WARNING", category="data_quality")
+            self.queue_analysis(sym)
 
     # ================================================================== market events
     async def on_stream_status(self, status: str, info: dict) -> None:
@@ -309,12 +414,42 @@ class TradingEngine:
             asyncio.create_task(self._gap_fill())
 
     async def _gap_fill(self) -> None:
-        """After a reconnect, backfill candles missed while disconnected."""
-        with session_scope() as s:
-            strat = get_strategy(s)
-        for sym in self.watch_symbols():
-            for tf in {strat.trend_timeframe, strat.setup_timeframe, strat.entry_timeframe}:
-                await self.backfill(sym, tf, 300)
+        """After a reconnect, backfill candles missed while disconnected (the periodic
+        integrity check catches candles that were still open at this point)."""
+        await self.candle_integrity_tick()
+
+    async def seed_quotes(self) -> None:
+        """Snapshot best bid/ask for every watched symbol over REST.
+
+        The bookTicker stream sends nothing until the book changes, so after a (re)connect
+        a quiet symbol would otherwise have no price at all - blocking entries and, worse,
+        stop-loss/take-profit checks for open positions."""
+        started = time.time()
+        try:
+            rows = await self.public.book_tickers()
+        except BinanceError as exc:
+            log.warning("book ticker snapshot failed: %s", exc)
+            return
+        watched = set(self.watch_symbols())
+        for r in rows:
+            sym = r.get("symbol")
+            if sym not in watched:
+                continue
+            existing = price_cache.get(sym)
+            if existing is not None and existing.updated_at >= started:
+                continue  # the stream already delivered something newer than this snapshot
+            try:
+                bid, ask = Decimal(r["bidPrice"]), Decimal(r["askPrice"])
+                bid_qty, ask_qty = Decimal(r["bidQty"]), Decimal(r["askQty"])
+            except (KeyError, ArithmeticError):
+                continue
+            if bid > 0 and ask > 0 and bid <= ask:
+                price_cache.update(sym, bid=bid, ask=ask, bid_qty=bid_qty, ask_qty=ask_qty)
+
+    def _ui_interval(self) -> float:
+        """Live dashboard updates per symbol: every second for small universes, slower
+        for large ones so hundreds of symbols do not flood the browser."""
+        return 1.0 if len(self.top_symbols) <= 20 else 5.0
 
     async def on_market_event(self, ev) -> None:
         if isinstance(ev, BookTickerEvent):
@@ -327,16 +462,19 @@ class TradingEngine:
         elif isinstance(ev, TickerEvent):
             price_cache.update(ev.symbol, last=ev.last_price, change_pct=ev.change_pct, quote_volume=ev.quote_volume)
             now = time.time()
-            if now - self._ticker_pub.get(ev.symbol, 0) >= 1:
+            if now - self._ticker_pub.get(ev.symbol, 0) >= self._ui_interval():
                 self._ticker_pub[ev.symbol] = now
                 q = price_cache.get(ev.symbol)
                 bus.publish("market", "ticker", {"symbol": ev.symbol, "price": ev.last_price, "change_pct": ev.change_pct,
                                                  "quote_volume": ev.quote_volume, "bid": q.bid if q else None,
                                                  "ask": q.ask if q else None})
         elif isinstance(ev, KlineEvent):
-            bus.publish("market", "kline", {"symbol": ev.symbol, "interval": ev.interval, "open_time": ev.open_time,
-                                            "open": ev.open, "high": ev.high, "low": ev.low, "close": ev.close,
-                                            "volume": ev.volume, "closed": ev.closed})
+            key, now = f"{ev.symbol}:{ev.interval}", time.time()
+            if ev.closed or now - self._ticker_pub.get(key, 0) >= self._ui_interval():
+                self._ticker_pub[key] = now
+                bus.publish("market", "kline", {"symbol": ev.symbol, "interval": ev.interval, "open_time": ev.open_time,
+                                                "open": ev.open, "high": ev.high, "low": ev.low, "close": ev.close,
+                                                "volume": ev.volume, "closed": ev.closed})
             if ev.closed:
                 c = cd.Candle(ev.open_time, ev.close_time, ev.open, ev.high, ev.low, ev.close, ev.volume,
                               ev.quote_volume, ev.trade_count)
@@ -473,7 +611,7 @@ class TradingEngine:
                                                          Position.status.in_(("OPEN", "CLOSING")))) is not None
             has_pending = self.om.has_active_entry(s, symbol)
         q = price_cache.get(symbol)
-        stale = q is None or q.age() > rs.stale_data_seconds or not q.ask
+        stale = self._quote_stale(q, rs) or not q.ask
         entry_price = q.ask if q and q.ask else Decimal(str(result.price or 0))
         if f is None:
             self._set_signal_status(signal_id, "NO_EXCHANGE_FILTERS")
@@ -536,6 +674,29 @@ class TradingEngine:
         assert self.om is not None
         if not self.has_lease:
             return None  # only the lease holder may place orders
+        async with self._pos_locks[position_id]:
+            # A resting exchange stop locks the coins; it must be gone before we sell.
+            # If it filled in the meantime, the cancel applies those fills (possibly
+            # closing the position, which the status check below then sees).
+            if not await self._cancel_exchange_stops(position_id):
+                return None
+            return await self._place_exit(position_id, reason)
+
+    async def _cancel_exchange_stops(self, position_id: int) -> bool:
+        assert self.om is not None
+        with session_scope() as s:
+            ids = [o.id for o in self.om.active_stops(s, position_id)]
+        for oid in ids:
+            status = await self.om.cancel(oid)
+            if status not in TERMINAL:
+                with session_scope() as s:
+                    log_event(s, "orders", f"Could not cancel exchange stop order {oid} (status {status}); "
+                              "exit deferred until it is resolved", "WARNING", category="order_unknown")
+                return False
+        return True
+
+    async def _place_exit(self, position_id: int, reason: str) -> int | None:
+        assert self.om is not None
         with session_scope() as s:
             pos = s.get(Position, position_id)
             if pos is None or pos.status != "OPEN" or pos.execution_mode != self.mode:
@@ -590,7 +751,7 @@ class TradingEngine:
             positions = [(p.id, p.symbol) for p in pf.open_positions(s, self.mode) if p.status == "OPEN"]
         for pid, symbol in positions:
             q = price_cache.get(symbol)
-            if q is None or q.age() > rs.stale_data_seconds or not q.bid:
+            if self._quote_stale(q, rs) or not q.bid:
                 if symbol not in self.stale_reported:
                     self.stale_reported.add(symbol)
                     with session_scope() as s:
@@ -624,6 +785,104 @@ class TradingEngine:
         if self.om:
             await self.om.reconcile()
 
+    async def protect_tick(self) -> None:
+        """TESTNET: keep exactly one resting stop-loss order on the exchange per open position.
+
+        The bot's own stop-loss only works while the bot runs and receives prices. The
+        exchange stop sits ``exchange_stop_buffer_pct`` under it, so it normally never
+        fires; it is the backstop when the worker is down, asleep or blind."""
+        om = self.om
+        if om is None or self.mode != "TESTNET" or not self.has_lease:
+            return
+        with session_scope() as s:
+            ex = get_execution(s)
+            orphans = list(s.scalars(select(TradingOrder.id).join(Position, TradingOrder.position_id == Position.id).where(
+                TradingOrder.execution_mode == self.mode, TradingOrder.purpose == "STOP",
+                TradingOrder.status.in_(ACTIVE), Position.status == "CLOSED")))
+            positions = [p.id for p in pf.open_positions(s, self.mode) if p.status == "OPEN"]
+        for oid in orphans:
+            await om.cancel(oid)
+        for pid in positions:
+            async with self._pos_locks[pid]:
+                if ex.exchange_stop_enabled:
+                    await self._ensure_exchange_stop(pid, ex)
+                else:
+                    await self._cancel_exchange_stops(pid)
+
+    async def _ensure_exchange_stop(self, pid: int, ex) -> None:
+        """Caller holds the position lock."""
+        om = self.om
+        assert om is not None
+        if time.monotonic() < self._stop_retry_at.get(pid, 0):
+            return
+        with session_scope() as s:
+            p = s.get(Position, pid)
+            if p is None or p.status != "OPEN" or p.stop_loss is None:
+                return
+            symbol, qty, bot_stop = p.symbol, p.quantity, p.stop_loss
+            current = [(o.id, o.status, o.quantity, Decimal((o.order_meta or {}).get("stop_price") or "0"))
+                       for o in om.active_stops(s, pid)]
+            n_prev = s.scalar(select(func.count()).select_from(TradingOrder).where(
+                TradingOrder.position_id == pid, TradingOrder.purpose == "STOP")) or 0
+        f = self.filters.get(symbol)
+        if f is None:
+            return
+        if "STOP_LOSS" in f.order_types:
+            order_type = "STOP_LOSS"  # market order once triggered: fills even through a price gap
+        elif "STOP_LOSS_LIMIT" in f.order_types:
+            order_type = "STOP_LOSS_LIMIT"
+        else:
+            if symbol not in self._stop_unsupported:
+                self._stop_unsupported.add(symbol)
+                with session_scope() as s:
+                    risk_event(s, "EXCHANGE_STOP_UNAVAILABLE", "WARNING",
+                               f"{symbol} supports no stop-loss order type; position is only protected while the bot runs")
+            return
+        market = order_type == "STOP_LOSS"
+        stop_px = round_step(bot_stop * (1 - ex.exchange_stop_buffer_pct / HUNDRED), f.tick_size, ROUND_DOWN)
+        limit_px = None if market else round_step(stop_px * (1 - STOP_LIMIT_OFFSET), f.tick_size, ROUND_DOWN)
+        sell_qty = f.round_qty(qty, market=market)
+        if stop_px <= 0 or sell_qty <= 0 or f.validate(sell_qty, limit_px or stop_px, market=market):
+            return  # dust or unsellable: nothing an exchange stop could do
+
+        if any(st != "NEW" for _, st, _, _ in current):
+            return  # submitting / unknown / partly filled: let reconciliation settle it first
+        if current:
+            oid, _, cur_qty, cur_stop = current[0]
+            if cur_qty == sell_qty and stop_px <= cur_stop * (1 + STOP_REPLACE_STEP):
+                return  # up to date
+            if await om.cancel(oid) != "CANCELED":
+                return  # filled or unknown: fills are applied by cancel()/reconcile
+            with session_scope() as s:  # a fill just before the cancel may have changed the position
+                p = s.get(Position, pid)
+                if p is None or p.status != "OPEN":
+                    return
+                if p.quantity != qty:
+                    sell_qty = f.round_qty(p.quantity, market=market)
+                    if sell_qty <= 0 or f.validate(sell_qty, limit_px or stop_px, market=market):
+                        return
+            n_prev += 1
+
+        q = price_cache.get(symbol)
+        if q is not None and q.bid and q.bid <= stop_px:
+            return  # would trigger immediately (the exchange rejects that); the bot's monitor exits instead
+        oid = await om.place(symbol=symbol, side="SELL", order_type=order_type, quantity=sell_qty, purpose="STOP",
+                             idempotency_key=f"STOP:{pid}:{n_prev}", expected_price=stop_px, price=limit_px,
+                             stop_price=stop_px, position_id=pid,
+                             reason=f"exchange stop-loss backstop ({ex.exchange_stop_buffer_pct}% under bot stop {bot_stop})",
+                             meta={"exit_reason": "STOP_LOSS_EXCHANGE"})
+        if oid is None:
+            return
+        with session_scope() as s:
+            o = s.get(TradingOrder, oid)
+            if o is not None and o.status in ("REJECTED", "EXPIRED"):
+                self._stop_retry_at[pid] = time.monotonic() + STOP_RETRY_SECONDS
+                risk_event(s, "EXCHANGE_STOP_REJECTED", "WARNING",
+                           f"Exchange stop for {symbol} rejected ({o.error_message}); retrying in "
+                           f"{STOP_RETRY_SECONDS // 60} min. The bot's own stop-loss still applies while it runs")
+            else:
+                self._stop_retry_at.pop(pid, None)
+
     async def risk_tick(self) -> None:
         with session_scope() as s:
             rs = get_risk(s)
@@ -632,7 +891,7 @@ class TradingEngine:
         if breach and not acct.halted:
             await self.halt(*breach)
         for sym in self.top_symbols:
-            stale = price_cache.is_stale(sym, rs.stale_data_seconds)
+            stale = self._quote_stale(price_cache.get(sym), rs)
             key = f"stale:{sym}"
             if stale and key not in self.stale_reported and self.stream_status == "connected":
                 self.stale_reported.add(key)
@@ -658,6 +917,21 @@ class TradingEngine:
                                                    "invested_capital": snap.invested_capital, "realised_pnl": snap.realised_pnl,
                                                    "unrealised_pnl": snap.unrealised_pnl, "drawdown": snap.drawdown,
                                                    "recorded_at": snap.recorded_at})
+
+    async def housekeeping_tick(self) -> None:
+        """Prune analysis rows that led to no action. With a large universe every symbol
+        produces a signal per entry candle, which would otherwise grow without bound.
+        Signals linked to orders, and every BUY/SELL decision, are kept forever."""
+        cutoff = datetime.now(timezone.utc) - timedelta(days=SIGNAL_RETENTION_DAYS)
+        with session_scope() as s:
+            referenced = select(TradingOrder.signal_id).where(TradingOrder.signal_id.is_not(None))
+            n = s.execute(AISignal.__table__.delete().where(
+                AISignal.signal == "HOLD", AISignal.action_status == "NONE", AISignal.created_at < cutoff,
+                AISignal.id.not_in(referenced))).rowcount
+            m = s.execute(MarketIndicator.__table__.delete().where(MarketIndicator.candle_time < cutoff)).rowcount
+            if n or m:
+                log_event(s, "worker", f"Housekeeping: pruned {n} HOLD signal(s) and {m} indicator row(s) older than "
+                          f"{SIGNAL_RETENTION_DAYS} days", category="system")
 
     async def lease_tick(self) -> None:
         if not self.has_lease:

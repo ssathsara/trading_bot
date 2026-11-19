@@ -87,7 +87,10 @@ class StrategySettings(BaseModel):
 
 
 class MarketSettings(BaseModel):
-    top_n: int = Field(10, ge=1, le=30)
+    top_n: int = Field(10, ge=0, le=1000)  # 0 = every eligible pair
+    # Liquidity floor: thin markets have wide spreads and slippage far above the
+    # risk engine's estimates. 0 disables the floor.
+    min_quote_volume_usdt: Decimal = Field(D("1000000"), ge=0)
     quote_asset: Literal["USDT"] = "USDT"
     ranking_refresh_minutes: int = Field(60, ge=5, le=1440)
     min_history_candles: int = Field(250, ge=50, le=1000)
@@ -109,6 +112,11 @@ class ExecutionSettings(BaseModel):
     paper_slippage_bps: Decimal = Field(D("5"), ge=0, le=500)
     estimated_fee_rate: Decimal = Field(D("0.001"), ge=0, le=D("0.01"))
     estimated_slippage_bps: Decimal = Field(D("5"), ge=0, le=500)
+    # TESTNET: keep a resting stop-loss order on the exchange for every open position, so
+    # the position stays protected while the bot is offline. It sits this far below the
+    # bot's own stop, so the bot normally exits first and the exchange stop is the backstop.
+    exchange_stop_enabled: bool = True
+    exchange_stop_buffer_pct: Decimal = Field(D("0.5"), ge=0, le=10)
 
     @model_validator(mode="after")
     def _check(self) -> "ExecutionSettings":

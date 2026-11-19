@@ -74,11 +74,14 @@ def rank_pairs(
     testnet_symbols: set[str] | None = None,
     history_ok: dict[str, bool] | None = None,
     excluded_permission_groups: set[str] | None = None,
+    min_quote_volume: Decimal = Decimal("0"),
 ) -> tuple[list[PairCandidate], list[PairCandidate]]:
     """Rank pairs by 24h quote volume.
 
     Returns ``(selected, rejected)``. ``selected`` holds at most ``top_n`` eligible
-    pairs with ranks 1..N. Symbols failing ``history_ok`` are skipped (that is part
+    pairs with ranks 1..N (``top_n <= 0`` = no limit). Pairs whose 24h quote volume
+    is below ``min_quote_volume`` are rejected as illiquid.
+    Symbols failing ``history_ok`` are skipped (that is part
     of eligibility, not a substitution). Testnet availability is *reported* via
     ``testnet_supported`` but never causes a substitution.
     """
@@ -102,6 +105,8 @@ def rank_pairs(
         groups = {p for ps in s.get("permissionSets") or [] for p in ps}
         if not reason and excluded_permission_groups and groups & excluded_permission_groups:
             reason = "tokenized stock/ETF (non-crypto asset)"
+        if not reason and c.quote_volume < min_quote_volume:
+            reason = f"low liquidity: 24h volume {c.quote_volume:.0f} < {min_quote_volume:.0f} {quote_asset}"
         if reason:
             c.eligible, c.exclusion_reason = False, reason
         candidates.append(c)
@@ -112,7 +117,7 @@ def rank_pairs(
     for c in candidates:
         if c.eligible and history_ok is not None and not history_ok.get(c.symbol, False):
             c.eligible, c.exclusion_reason = False, "insufficient historical data"
-        if c.eligible and len(selected) < top_n:
+        if c.eligible and (top_n <= 0 or len(selected) < top_n):
             c.rank = len(selected) + 1
             selected.append(c)
         elif not c.eligible:
