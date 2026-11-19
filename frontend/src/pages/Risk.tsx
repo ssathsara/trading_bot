@@ -23,6 +23,15 @@ const FIELDS: [string, string, string?][] = [
   ["trailing_stop_pct", "Trailing stop %"],
 ];
 
+const DYN_FIELDS: [string, string][] = [
+  ["dyn_trail_atr_mult", "Trail stop: ATR multiple under high"],
+  ["dyn_breakeven_atr_mult", "Break-even after +N × ATR"],
+  ["dyn_tp_extend_adx", "Raise take-profit when ADX ≥"],
+  ["dyn_tp_extend_atr_mult", "Raised take-profit: close + N × ATR"],
+  ["dyn_tp_tighten_rsi", "Lower take-profit when RSI ≥"],
+  ["dyn_tp_tighten_atr_mult", "Lowered take-profit: close + N × ATR"],
+];
+
 export default function Risk() {
   const settings = useSettings();
   const status = useRiskStatus();
@@ -81,6 +90,21 @@ export default function Risk() {
                 </div>
                 <div className="flex items-center gap-2 text-sm">
                   <Switch checked={!!form.trailing_stop_enabled} onChange={(v) => setForm({ ...form, trailing_stop_enabled: v })} label="Trailing stop" />Trailing stop enabled
+                </div>
+                <div className="border-t border-border pt-3">
+                  <div className="flex items-center gap-2 text-sm">
+                    <Switch checked={!!form.dynamic_exits_enabled} onChange={(v) => setForm({ ...form, dynamic_exits_enabled: v })} label="Dynamic exits" />Dynamic stop-loss / take-profit
+                  </div>
+                  <p className="mt-1 text-xs text-muted">Each open position's exits are re-analysed on every closed candle of its own symbol. The stop-loss only moves up; the take-profit rises in strong trends and comes down when momentum fades.</p>
+                  {form.dynamic_exits_enabled && (
+                    <div className="mt-3 grid grid-cols-2 gap-3">
+                      {DYN_FIELDS.map(([k, label]) => (
+                        <label key={k} className="text-xs text-muted">{label}
+                          <Input className="num mt-1" value={form[k] ?? ""} onChange={(e) => setForm({ ...form, [k]: e.target.value })} inputMode="decimal" />
+                        </label>
+                      ))}
+                    </div>
+                  )}
                 </div>
                 <ErrorBox error={save.error} />
                 {save.error && (save.error as any).detail && Array.isArray((save.error as any).detail) && (

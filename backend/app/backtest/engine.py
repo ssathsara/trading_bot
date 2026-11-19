@@ -30,7 +30,7 @@ import pandas as pd
 from app.analysis.indicators import compute_indicators
 from app.analysis.strategy import evaluate
 from app.exchange.filters import SymbolFilters
-from app.risk.engine import AccountSnapshot, EntryRequest, check_hard_limits, evaluate_entry
+from app.risk.engine import AccountSnapshot, EntryRequest, adjust_exits, check_hard_limits, evaluate_entry
 from app.settings_store import ExecutionSettings, RiskSettings, StrategySettings
 
 HIGHER_TF = {"1m": ("5m", 5), "5m": ("15m", 3), "15m": ("1h", 4), "1h": ("4h", 4), "4h": ("1d", 6)}
@@ -143,7 +143,7 @@ def run_backtest(candles: pd.DataFrame, p: BacktestParams, strategy: StrategySet
                 cash -= cost + fee
                 total_fees += fee
                 pos = {"qty": qty, "entry": price, "cost": cost, "entry_fee": fee, "stop": pending_decision.stop_loss,
-                       "target": pending_decision.take_profit, "time": str(ts), "signal_time": signal_time}
+                       "target": pending_decision.take_profit, "time": str(ts), "signal_time": signal_time, "high": price}
         elif pending == "SELL" and pos is not None:
             close_pos(i, fill("SELL", opens[i]), "STRATEGY_EXIT")
         pending, pending_decision = None, None
@@ -161,6 +161,15 @@ def run_backtest(candles: pd.DataFrame, p: BacktestParams, strategy: StrategySet
                 close_pos(i, pos["target"] * (1 - slip), "TAKE_PROFIT")
         if pos is not None:
             exposure_bars += 1
+            pos["high"] = max(pos["high"], Decimal(str(highs[i])))
+            # dynamic exits: re-evaluated at this bar's close, effective from the next bar
+            if risk.dynamic_exits_enabled:
+                row = base.iloc[i]
+                dv = lambda k: Decimal(str(float(row[k]))) if k in row and row[k] == row[k] else None  # noqa: E731
+                adj = adjust_exits(entry=pos["entry"], stop=pos["stop"], target=pos["target"], highest=pos["high"],
+                                   close=Decimal(str(closes[i])), atr=dv("atr"), adx=dv("adx"), ema_20=dv("ema_20"),
+                                   rsi=dv("rsi"), rs=risk, tick=f.tick_size, cost_rate=p.fee_rate + slip)
+                pos["stop"], pos["target"] = adj.stop, adj.target
 
         # ---- 3. mark to market at close
         c = Decimal(str(closes[i]))

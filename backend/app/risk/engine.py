@@ -198,6 +198,57 @@ def update_trailing_stop(stop: Decimal, highest: Decimal, trailing_pct: Decimal,
     return max(stop, candidate)
 
 
+@dataclass
+class ExitAdjustment:
+    stop: Decimal
+    target: Decimal
+    reasons: list[str] = field(default_factory=list)
+
+
+def adjust_exits(*, entry: Decimal, stop: Decimal, target: Decimal, highest: Decimal, close: Decimal,
+                 atr: Decimal | None, adx: Decimal | None, ema_20: Decimal | None, rsi: Decimal | None,
+                 rs: RiskSettings, tick: Decimal, cost_rate: Decimal) -> ExitAdjustment:
+    """Re-evaluate one open position's exits from its symbol's latest closed candle.
+
+    Stop-loss only ever moves UP (never adds risk):
+      * break-even once price has run ``dyn_breakeven_atr_mult`` x ATR above entry
+      * ATR trailing stop: highest price - ``dyn_trail_atr_mult`` x current ATR
+    Take-profit follows the trend:
+      * strong trend (ADX >= threshold and close > EMA20) -> raised to close + N x ATR
+      * weakening (close < EMA20 or RSI overbought) while in profit -> lowered to close + N x ATR
+    """
+    out = ExitAdjustment(stop=stop, target=target)
+    if atr is None or atr <= 0:
+        return out
+    breakeven = round_step(entry * (1 + 2 * cost_rate), tick, ROUND_UP)
+    highest = max(highest, entry)
+
+    if highest >= entry + rs.dyn_breakeven_atr_mult * atr and breakeven > out.stop:
+        out.stop = breakeven
+        out.reasons.append("break-even reached")
+    trail = round_step(highest - rs.dyn_trail_atr_mult * atr, tick, ROUND_DOWN)
+    if trail > out.stop:
+        out.stop = trail
+        out.reasons.append(f"ATR trail ({rs.dyn_trail_atr_mult} x ATR under high)")
+
+    strong = adx is not None and ema_20 is not None and adx >= rs.dyn_tp_extend_adx and close > ema_20
+    weak = (ema_20 is not None and close < ema_20) or (rsi is not None and rsi >= rs.dyn_tp_tighten_rsi)
+    if strong:
+        cand = round_step(close + rs.dyn_tp_extend_atr_mult * atr, tick, ROUND_UP)
+        if cand > out.target:
+            out.target = cand
+            out.reasons.append(f"strong trend (ADX {adx:.0f}): take-profit raised")
+    elif weak and close > breakeven:
+        cand = round_step(max(close + rs.dyn_tp_tighten_atr_mult * atr, breakeven), tick, ROUND_UP)
+        if cand < out.target:
+            out.target = cand
+            why = "close below EMA20" if ema_20 is not None and close < ema_20 else f"RSI {rsi:.0f} overbought"
+            out.reasons.append(f"momentum fading ({why}): take-profit lowered")
+    if out.target <= out.stop:
+        out.target = target  # never let the target fall to/below the stop
+    return out
+
+
 def exit_trigger(price: Decimal, stop: Decimal | None, target: Decimal | None) -> str | None:
     """Spot long exits: price at/below stop -> STOP_LOSS; at/above target -> TAKE_PROFIT."""
     if stop is not None and price <= stop:

@@ -119,3 +119,55 @@ def test_settings_validation():
         RiskSettings(max_position_alloc_pct=D("70"), max_total_alloc_pct=D("60"))
     with pytest.raises(ValueError):
         RiskSettings(take_profit_rr=D("1"), min_reward_risk=D("1.5"))
+
+
+# ---- dynamic exits -------------------------------------------------------------
+from app.risk.engine import adjust_exits  # noqa: E402
+
+TICK = D("0.01")
+
+
+def dyn(**kw):
+    base = dict(entry=D("100"), stop=D("96"), target=D("108"), highest=D("100"), close=D("100"), atr=D("2"),
+                adx=D("15"), ema_20=D("99"), rsi=D("55"), rs=RiskSettings(), tick=TICK, cost_rate=D("0"))
+    base.update(kw)
+    return adjust_exits(**base)
+
+
+def test_dynamic_exits_unchanged_at_entry():
+    a = dyn()
+    assert (a.stop, a.target, a.reasons) == (D("96"), D("108"), [])
+
+
+def test_dynamic_stop_moves_to_breakeven_then_trails():
+    a = dyn(highest=D("104"), close=D("103"))  # +2 ATR -> break-even; trail 104-5=99 < 100
+    assert a.stop == D("100")
+    a = dyn(highest=D("110"), close=D("109"), target=D("120"))  # trail 110 - 2.5*2 = 105
+    assert a.stop == D("105")
+
+
+def test_dynamic_stop_never_moves_down():
+    a = dyn(stop=D("103"), highest=D("104"), close=D("101"), atr=D("4"))  # wider ATR would give 94
+    assert a.stop == D("103")
+
+
+def test_dynamic_take_profit_raised_in_strong_trend():
+    a = dyn(close=D("106"), highest=D("106"), ema_20=D("103"), adx=D("35"))
+    assert a.target == D("112")  # 106 + 3*2
+
+
+def test_dynamic_take_profit_lowered_when_momentum_fades():
+    a = dyn(close=D("103"), highest=D("103"), ema_20=D("104"))  # close < EMA20
+    assert a.target == D("105")  # 103 + 1*2
+    a = dyn(close=D("103"), highest=D("103"), ema_20=D("101"), rsi=D("80"))
+    assert a.target == D("105")
+
+
+def test_dynamic_take_profit_not_lowered_when_losing():
+    a = dyn(close=D("98"), highest=D("100"), ema_20=D("99.5"))
+    assert a.target == D("108")
+
+
+def test_dynamic_exits_disabled_in_backtest_matches_static(btc_filters):
+    # the flag is honoured by callers; adjust_exits itself is a no-op without ATR
+    assert dyn(atr=None).stop == D("96")

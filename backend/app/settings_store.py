@@ -33,6 +33,15 @@ class RiskSettings(BaseModel):
     take_profit_pct: Decimal = Field(D("4"), gt=0, le=200)
     trailing_stop_enabled: bool = False
     trailing_stop_pct: Decimal = Field(D("1.5"), gt=0, le=50)
+    # Dynamic exits: re-evaluate each open position's stop-loss / take-profit on every
+    # closed entry-timeframe candle, from that symbol's own ATR / ADX / EMA20 / RSI.
+    dynamic_exits_enabled: bool = True
+    dyn_trail_atr_mult: Decimal = Field(D("2.5"), gt=0, le=20)      # stop trails highest price by N x ATR
+    dyn_breakeven_atr_mult: Decimal = Field(D("2"), gt=0, le=20)    # move stop to break-even after +N x ATR
+    dyn_tp_extend_adx: Decimal = Field(D("25"), ge=0, le=100)       # trend this strong -> raise take-profit
+    dyn_tp_extend_atr_mult: Decimal = Field(D("3"), gt=0, le=20)    # ... to close + N x ATR
+    dyn_tp_tighten_rsi: Decimal = Field(D("75"), gt=50, le=100)     # overbought (or close < EMA20) -> lower take-profit
+    dyn_tp_tighten_atr_mult: Decimal = Field(D("1"), gt=0, le=20)   # ... to close + N x ATR
     max_consecutive_losses: int = Field(3, ge=1, le=50)
     cooldown_minutes: int = Field(60, ge=0, le=10080)
     max_order_notional_usdt: Decimal = Field(D("2500"), gt=0)

@@ -42,7 +42,8 @@ from app.market.discovery import rank_pairs
 from app.market.price_cache import price_cache
 from app.models import AISignal, MarketCandle, MarketIndicator, Position, SystemSetting, TradingOrder, TradingPair
 from app.portfolio import service as pf
-from app.risk.engine import AccountSnapshot, EntryRequest, check_hard_limits, evaluate_entry, exit_trigger, update_trailing_stop
+from app.risk.engine import (AccountSnapshot, EntryRequest, adjust_exits, check_hard_limits, evaluate_entry, exit_trigger,
+                             update_trailing_stop)
 from app.settings_store import get_control, get_execution, get_market, get_risk, get_strategy
 
 log = logging.getLogger("worker")
@@ -530,6 +531,8 @@ class TradingEngine:
                           data_issues=issues, ml_probability=proba, ml_available=available)
         signal_id = self._persist_signal(symbol, result, frames, strat)
         self.last_analysis[symbol] = time.time()
+        if has_pos:
+            self.update_dynamic_exits(symbol, frames["entry"])
         with session_scope() as s:
             ctl = get_control(s)
         if result.signal == "BUY" and ctl.state == "RUNNING" and ctl.auto_trading:
@@ -539,6 +542,39 @@ class TradingEngine:
         elif result.signal == "BUY":
             self._set_signal_status(signal_id, f"NOT_EXECUTED_{ctl.state}" if ctl.state != "RUNNING" else "AUTO_TRADING_OFF")
         return result
+
+    def update_dynamic_exits(self, symbol: str, df) -> None:
+        """Re-evaluate the open position's stop-loss / take-profit from this symbol's latest
+        closed candle. The stop only rises; protect_tick then moves the exchange stop up too."""
+        if df is None or df.empty:
+            return
+        last = df.iloc[-1]
+        num = lambda k: Decimal(str(float(last[k]))) if k in last and last[k] == last[k] else None  # noqa: E731
+        close, atr = num("close"), num("atr")
+        if close is None or not atr:
+            return
+        f = self.filters.get(symbol)
+        tick = f.tick_size if f else Decimal("0.00000001")
+        with session_scope() as s:
+            rs, ex = get_risk(s), get_execution(s)
+            if not rs.dynamic_exits_enabled:
+                return
+            p = s.scalar(select(Position).where(Position.execution_mode == self.mode, Position.symbol == symbol,
+                                                Position.status == "OPEN"))
+            if p is None or p.stop_loss is None or p.take_profit is None:
+                return
+            adj = adjust_exits(entry=p.average_entry_price, stop=p.stop_loss, target=p.take_profit,
+                               highest=max(p.highest_price or close, close), close=close, atr=atr,
+                               adx=num("adx"), ema_20=num("ema_20"), rsi=num("rsi"), rs=rs, tick=tick,
+                               cost_rate=ex.estimated_fee_rate + ex.estimated_slippage_bps / Decimal("10000"))
+            if adj.stop == p.stop_loss and adj.target == p.take_profit:
+                return
+            old_sl, old_tp = p.stop_loss, p.take_profit
+            p.stop_loss, p.take_profit = adj.stop, adj.target
+            log_event(s, "trading", f"{symbol} exits updated: SL {old_sl} -> {adj.stop}, TP {old_tp} -> {adj.target} "
+                      f"({'; '.join(adj.reasons)})", "INFO", category="exit_update",
+                      meta={"position_id": p.id, "stop_loss": str(adj.stop), "take_profit": str(adj.target)})
+        self._position_check.set()
 
     def _persist_signal(self, symbol: str, r: SignalResult, frames: dict, strat) -> int:
         with session_scope() as s:
