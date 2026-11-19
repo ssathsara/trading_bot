@@ -150,6 +150,9 @@ class PublicMarketClient(_BaseClient):
         return await self._request("GET", "/api/v3/klines", params)
 
 
+TIMESTAMP_OUTSIDE_RECV_WINDOW = -1021
+
+
 class TestnetClient(_BaseClient):
     """Signed client for the Binance Spot TESTNET only."""
 
@@ -183,7 +186,17 @@ class TestnetClient(_BaseClient):
         # Defence in depth: re-check the host at every signed call.
         if (urlparse(self.base_url).hostname or "").lower() not in TESTNET_REST_HOSTS:
             raise BinanceError("signed request blocked: non-testnet host")
-        return await self._request(method, path, self._sign(params), headers={"X-MBX-APIKEY": self._key}, retries=0 if method != "GET" else 2)
+        retries = 0 if method != "GET" else 2
+        try:
+            return await self._request(method, path, self._sign(params), headers={"X-MBX-APIKEY": self._key}, retries=retries)
+        except BinanceAPIError as exc:
+            # -1021: our clock drifted (e.g. the Docker VM after the host slept). The exchange
+            # rejected the request BEFORE processing it, so re-syncing and re-signing once is
+            # safe even for order placement.
+            if exc.code != TIMESTAMP_OUTSIDE_RECV_WINDOW:
+                raise
+        await self.sync_time()
+        return await self._request(method, path, self._sign(params), headers={"X-MBX-APIKEY": self._key}, retries=retries)
 
     async def exchange_info(self) -> dict:
         return await self._request("GET", "/api/v3/exchangeInfo")

@@ -96,6 +96,7 @@ class TradingEngine:
         self._analysis_queue: asyncio.Queue[str] = asyncio.Queue()
         self._queued: set[str] = set()
         self._position_check = asyncio.Event()
+        self._bg_tasks: set[asyncio.Task] = set()
         # Serialises exit placement and exchange-stop maintenance per position, so a stop
         # can never be (re)placed between cancelling it and submitting the exit.
         self._pos_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -412,7 +413,10 @@ class TradingEngine:
             if status == "stale":
                 risk_event(s, "STALE_MARKET_DATA", "WARNING", "Market data stream went silent; new entries blocked until data resumes")
         if status == "connected" and prev in ("reconnecting", "disconnected", "stale", "error"):
-            asyncio.create_task(self._gap_fill())
+            # keep a reference: the loop only holds weak refs, so an unreferenced task can be GC'd mid-run
+            task = asyncio.create_task(self._gap_fill(), name="gap-fill")
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
 
     async def _gap_fill(self) -> None:
         """After a reconnect, backfill candles missed while disconnected (the periodic
