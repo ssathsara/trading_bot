@@ -47,7 +47,7 @@ export interface Portfolio {
   halt_reason: string | null;
 }
 
-export interface Control { state: "STOPPED" | "RUNNING" | "PAUSED"; auto_trading: boolean; execution_mode: "PAPER" | "TESTNET" }
+export interface Control { state: "STOPPED" | "RUNNING" | "PAUSED"; auto_trading: boolean; execution_mode: "PAPER" | "TESTNET" | "LIVE" }
 
 export interface Signal {
   id: number; symbol: string; signal: "BUY" | "SELL" | "HOLD"; confidence_score: Dec; strategy_name: string;

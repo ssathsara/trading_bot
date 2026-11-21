@@ -175,11 +175,12 @@ class SettingsBundle(BaseModel):
     strategy: StrategySettings
     market: MarketSettings
     execution: ExecutionSettings
-    execution_mode: Literal["PAPER", "TESTNET"]
+    execution_mode: Literal["PAPER", "TESTNET", "LIVE"]
     auto_trading: bool
     state: str
     testnet_configured: bool
     live_trading_available: bool = False
+    live_max_capital_usdt: Decimal | None = None
 
 
 class SettingsUpdate(BaseModel):
@@ -187,8 +188,12 @@ class SettingsUpdate(BaseModel):
     market: MarketSettings | None = None
     execution: ExecutionSettings | None = None
     auto_trading: bool | None = None
-    # Only simulation modes exist; any other value (e.g. LIVE) fails validation.
-    execution_mode: Literal["PAPER", "TESTNET"] | None = None
+    execution_mode: Literal["PAPER", "TESTNET", "LIVE"] | None = None
+    # Switching to LIVE (real money) requires this exact phrase.
+    confirm_live: str | None = Field(None, max_length=64)
+
+
+LIVE_CONFIRMATION_PHRASE = "I UNDERSTAND THIS USES REAL MONEY"
 
 
 class BacktestRequest(BaseModel):

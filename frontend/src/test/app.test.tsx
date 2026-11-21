@@ -114,19 +114,59 @@ describe("live market", () => {
 });
 
 describe("settings", () => {
-  it("never offers a live trading mode", async () => {
+  const baseSettings = {
+    execution_mode: "PAPER", auto_trading: true, state: "STOPPED", testnet_configured: false, live_trading_available: false,
+    live_max_capital_usdt: null,
+    risk: {}, strategy: { name: "trend_following_v1", trend_timeframe: "1h", setup_timeframe: "15m", entry_timeframe: "5m", weights: { trend: "30" }, exit_on_trend_reversal: true, ml_filter_enabled: false },
+    market: { selected_symbols: [], excluded_symbols: [] }, execution: { order_type: "MARKET", allow_market_orders: true },
+  };
+
+  it("disables the live option unless the server enabled it", async () => {
     login();
-    const settings = {
-      execution_mode: "PAPER", auto_trading: true, state: "STOPPED", testnet_configured: false, live_trading_available: false,
-      risk: {}, strategy: { name: "trend_following_v1", trend_timeframe: "1h", setup_timeframe: "15m", entry_timeframe: "5m", weights: { trend: "30" }, exit_on_trend_reversal: true, ml_filter_enabled: false },
-      market: { selected_symbols: [], excluded_symbols: [] }, execution: { order_type: "MARKET", allow_market_orders: true },
-    };
-    mockApi({ "/api/system/status": status, "/api/settings": settings });
+    mockApi({ "/api/system/status": status, "/api/settings": baseSettings });
     renderWithProviders(<AppRoutes />, "/settings");
     const select = await screen.findByLabelText("Execution mode");
-    const options = within(select).getAllByRole("option").map((o) => o.textContent ?? "");
-    expect(options.some((o) => /live/i.test(o))).toBe(false);
-    expect(options).toHaveLength(2);
+    expect(within(select).getAllByRole("option")).toHaveLength(3);
     expect(within(select).getByRole("option", { name: /testnet/i })).toBeDisabled();
+    expect(within(select).getByRole("option", { name: /live/i })).toBeDisabled();
+  });
+
+  it("switches to LIVE only after the exact confirmation phrase", async () => {
+    login();
+    const puts: unknown[] = [];
+    mockApi({
+      "/api/system/status": status,
+      "/api/settings": (init?: RequestInit) => {
+        if (init?.method === "PUT") puts.push(JSON.parse(String(init.body)));
+        return [200, { ...baseSettings, live_trading_available: true, live_max_capital_usdt: "100" }];
+      },
+    });
+    renderWithProviders(<AppRoutes />, "/settings");
+    const select = await screen.findByLabelText("Execution mode");
+    await waitFor(() => expect(within(select).getByRole("option", { name: /live/i })).not.toBeDisabled());
+    await userEvent.selectOptions(select, "LIVE");
+    expect(await screen.findByTestId("live-confirm")).toHaveTextContent("100 USDT");
+    expect(puts).toHaveLength(0); // choosing LIVE alone sends nothing
+    const go = screen.getByRole("button", { name: "Switch to LIVE" });
+    await userEvent.type(screen.getByLabelText("Live confirmation"), "i understand");
+    expect(go).toBeDisabled();
+    await userEvent.clear(screen.getByLabelText("Live confirmation"));
+    await userEvent.type(screen.getByLabelText("Live confirmation"), "I UNDERSTAND THIS USES REAL MONEY");
+    await userEvent.click(go);
+    await waitFor(() => expect(puts).toEqual([{ execution_mode: "LIVE", confirm_live: "I UNDERSTAND THIS USES REAL MONEY" }]));
+  });
+
+  it("shows a red real-money banner in LIVE mode", async () => {
+    login();
+    mockApi({
+      "/api/system/status": { ...status, execution_mode: "LIVE", control: { ...status.control, execution_mode: "LIVE" },
+        live_trading_enabled: true, live: { configured: true, max_capital_usdt: "100" } },
+      "/api/settings": { ...baseSettings, execution_mode: "LIVE", live_trading_available: true, live_max_capital_usdt: "100" },
+    });
+    renderWithProviders(<AppRoutes />, "/settings");
+    const banner = screen.getByTestId("env-banner");
+    await waitFor(() => expect(banner).toHaveTextContent(/REAL MONEY/));
+    expect(banner).toHaveTextContent("Capital cap: 100 USDT");
+    expect(banner.className).toMatch(/bg-down/);
   });
 });

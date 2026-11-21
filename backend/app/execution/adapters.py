@@ -1,4 +1,4 @@
-"""Execution adapters: local paper engine and Binance Spot Testnet.
+"""Execution adapters: local paper engine, Binance Spot Testnet and Binance Spot LIVE.
 
 Both expose the same async interface and report *cumulative* fills with stable
 fill ids, so the order manager can apply them idempotently.
@@ -12,7 +12,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
 
-from app.exchange.rest import BinanceAPIError, BinanceNetworkError, BinanceRateLimitError, TestnetClient
+from app.exchange.rest import BinanceAPIError, BinanceNetworkError, BinanceRateLimitError, LiveClient, SignedClient, TestnetClient
 
 log = logging.getLogger(__name__)
 BPS = Decimal("10000")
@@ -216,13 +216,16 @@ ORDER_NOT_FOUND = -2013
 PriceLookup = Callable[[str], Awaitable[Decimal | None]]
 
 
-class TestnetExecutionAdapter:
-    """Binance Spot Testnet execution. Never falls back to any other endpoint."""
+class ExchangeExecutionAdapter:
+    """Execution on a Binance Spot account. Never falls back to any other endpoint."""
 
-    __test__ = False
-    mode = "TESTNET"
+    mode = ""
+    venue = ""
+    client_type: type[SignedClient] = SignedClient
 
-    def __init__(self, client: TestnetClient) -> None:
+    def __init__(self, client: SignedClient) -> None:
+        if not isinstance(client, self.client_type):  # live keys never reach the testnet adapter and vice versa
+            raise TypeError(f"{type(self).__name__} requires a {self.client_type.__name__}")
         self.client = client
 
     @staticmethod
@@ -243,7 +246,7 @@ class TestnetExecutionAdapter:
         except BinanceAPIError as exc:
             if exc.code in UNKNOWN_CODES:
                 return ExecutionReport("UNKNOWN", error=f"exchange reported unknown status: {exc.msg}")
-            return ExecutionReport("REJECTED", error=f"testnet rejected order ({exc.code}): {exc.msg}")
+            return ExecutionReport("REJECTED", error=f"{self.venue} rejected order ({exc.code}): {exc.msg}")
         return ExecutionReport(resp.get("status", "UNKNOWN"), str(resp.get("orderId")), self._fills_from_full(resp))
 
     async def query(self, req: OrderRequest) -> ExecutionReport:
@@ -251,7 +254,7 @@ class TestnetExecutionAdapter:
             o = await self.client.get_order(req.symbol, req.client_order_id)
         except BinanceAPIError as exc:
             if exc.code == ORDER_NOT_FOUND:
-                return ExecutionReport("NOT_FOUND", error="order not found on testnet")
+                return ExecutionReport("NOT_FOUND", error=f"order not found on {self.venue}")
             return ExecutionReport("UNKNOWN", error=str(exc))
         except BinanceNetworkError as exc:
             return ExecutionReport("UNKNOWN", error=str(exc))
@@ -281,3 +284,20 @@ class TestnetExecutionAdapter:
             if b["asset"] == asset:
                 return Decimal(b["free"])
         return Decimal("0")
+
+
+class TestnetExecutionAdapter(ExchangeExecutionAdapter):
+    """Binance Spot Testnet execution."""
+
+    __test__ = False
+    mode = "TESTNET"
+    venue = "testnet"
+    client_type = TestnetClient
+
+
+class LiveExecutionAdapter(ExchangeExecutionAdapter):
+    """Binance Spot production execution. REAL MONEY."""
+
+    mode = "LIVE"
+    venue = "live"
+    client_type = LiveClient

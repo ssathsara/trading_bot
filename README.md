@@ -8,7 +8,7 @@ A locally deployable, AI-assisted cryptocurrency **spot** trading platform built
 * executes trades **only** in a local paper-trading engine or on the **Binance Spot Testnet**;
 * tracks the portfolio, P&L, risk limits and history in a React dashboard.
 
-> **No real money.** Live trading does not exist in this release. The configuration rejects any mode other than `PAPER` or `TESTNET`, credentials are only ever sent to `testnet.binance.vision`, and market data comes from Binance's read-only data hosts. Default mode is **PAPER**.
+> **Real money is opt-in.** Default mode is **PAPER**. A `LIVE` mode exists but stays disabled unless `LIVE_TRADING_ENABLED=true`, live API keys and a `LIVE_MAX_CAPITAL_USDT` cap are set in `.env`, and an admin types a confirmation phrase in the dashboard. Testnet keys are only ever sent to `testnet.binance.vision`, live keys only to `api.binance.com`. See [Live trading (real money)](#live-trading-real-money).
 >
 > Nothing here is financial advice. The strategy's "confidence" is a rule-based score, not a probability of profit. No claim is made that the strategy is profitable; backtest results are hypothetical.
 
@@ -215,6 +215,31 @@ How testnet mode behaves:
 * Before every entry, the worker checks your real testnet USDT balance.
 * After every order, the worker reconciles order status and fills with the testnet. It never falls back to another endpoint.
 * The system ledger starts from `INITIAL_BALANCE_USDT`. Testnet accounts hold large demo balances, but this ledger only tracks what the agent itself trades.
+
+## Live trading (real money)
+
+> **You can lose money.** The strategy is not proven profitable; backtest, paper and testnet results do not predict live results. Run paper/testnet for weeks first and start with an amount you can afford to lose.
+
+1. On binance.com go to **Account → API Management → Create API** (system-generated / HMAC).
+2. Edit its restrictions: enable **only** *Enable Spot & Margin Trading*. Keep **withdrawals disabled**. Restrict access to **trusted IPs only** (your public IP).
+3. Add to `.env`:
+   ```ini
+   LIVE_TRADING_ENABLED=true
+   BINANCE_LIVE_API_KEY=...
+   BINANCE_LIVE_API_SECRET=...
+   LIVE_MAX_CAPITAL_USDT=100     # the most the bot may trade with
+   ```
+4. `docker compose up -d` to apply, then in the dashboard: **Stop** the engine → **System Settings → Trading mode → LIVE** → type `I UNDERSTAND THIS USES REAL MONEY` → **Switch to LIVE** → **Start**.
+
+How LIVE mode behaves:
+
+* The banner turns solid red. LIVE has its own ledger, separate from PAPER/TESTNET results.
+* The LIVE ledger starts at `LIVE_MAX_CAPITAL_USDT` and all position sizing is based on it. An extra check blocks any entry that would push invested capital above the cap, regardless of risk settings.
+* Before each entry the worker checks your real free USDT balance on Binance.
+* A resting exchange stop-loss order protects every open position while the bot is offline (same as testnet).
+* The ledger only tracks what the bot itself trades. Don't trade the same coins manually on that account while the bot runs.
+* To stop: **Stop** halts new entries (stops stay active); close positions from the Positions page; set `LIVE_TRADING_ENABLED=false` and restart to disable LIVE entirely.
+* The cap is applied when the LIVE ledger is first created. Changing `LIVE_MAX_CAPITAL_USDT` later still limits new entries, but the ledger's starting balance does not change.
 
 ## Configuration
 

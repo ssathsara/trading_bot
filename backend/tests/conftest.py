@@ -22,6 +22,10 @@ os.environ.update({
     "EXECUTION_MODE": "PAPER",
     "BINANCE_TESTNET_API_KEY": "",
     "BINANCE_TESTNET_API_SECRET": "",
+    "LIVE_TRADING_ENABLED": "false",
+    "BINANCE_LIVE_API_KEY": "",
+    "BINANCE_LIVE_API_SECRET": "",
+    "LIVE_MAX_CAPITAL_USDT": "0",
 })
 
 from app import db as dbmod  # noqa: E402

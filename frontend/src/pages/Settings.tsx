@@ -4,6 +4,9 @@ import { fmtDuration } from "@/lib/format";
 import { Badge, Button, Card, CardContent, CardHeader, CardTitle, ErrorBox, Input, PageHeader, Select, Switch } from "@/components/ui";
 import { ControlButtons } from "./Dashboard";
 
+// Must match LIVE_CONFIRMATION_PHRASE in backend/app/schemas.py
+const LIVE_PHRASE = "I UNDERSTAND THIS USES REAL MONEY";
+
 function Row({ label, ok, detail }: { label: string; ok: boolean | undefined; detail?: string }) {
   return (
     <div className="flex items-center justify-between border-b border-border/60 py-2 text-sm last:border-0">
@@ -20,6 +23,8 @@ export default function SettingsPage() {
   const [strategy, setStrategy] = useState<any>(null);
   const [market, setMarket] = useState<any>(null);
   const [execution, setExecution] = useState<any>(null);
+  // non-null while the LIVE confirmation box is open (holds the typed phrase)
+  const [liveDraft, setLiveDraft] = useState<string | null>(null);
   useEffect(() => {
     if (s && !strategy) { setStrategy(s.strategy); setMarket(s.market); setExecution(s.execution); }
   }, [s, strategy]);
@@ -33,21 +38,42 @@ export default function SettingsPage() {
 
   return (
     <div>
-      <PageHeader title="System Settings" description="Simulation modes only — there is no live-trading option in this release."><ControlButtons /></PageHeader>
+      <PageHeader title="System Settings" description="Paper and testnet are simulations. LIVE mode trades real money and must be enabled in the server's .env."><ControlButtons /></PageHeader>
       <ErrorBox error={error ?? save.error} />
       <div className="grid gap-4 lg:grid-cols-2">
         <Card>
           <CardHeader><CardTitle>Trading mode</CardTitle></CardHeader>
           <CardContent className="space-y-3 text-sm">
             <div className="flex items-center gap-3">
-              <Select value={s?.execution_mode ?? "PAPER"} aria-label="Execution mode"
-                onChange={(e) => save.mutate({ path: "/api/settings", body: { execution_mode: e.target.value } })}>
+              <Select value={liveDraft !== null ? "LIVE" : s?.execution_mode ?? "PAPER"} aria-label="Execution mode"
+                onChange={(e) => {
+                  if (e.target.value === "LIVE") { setLiveDraft(""); return; }
+                  setLiveDraft(null);
+                  save.mutate({ path: "/api/settings", body: { execution_mode: e.target.value } });
+                }}>
                 <option value="PAPER">Local paper trading (simulated)</option>
                 <option value="TESTNET" disabled={!s?.testnet_configured}>Binance Spot Testnet{!s?.testnet_configured ? " (credentials not configured)" : ""}</option>
+                <option value="LIVE" disabled={!s?.live_trading_available}>LIVE — real money{!s?.live_trading_available ? " (not enabled on server)" : ""}</option>
               </Select>
-              <Badge tone="neutral">Live: unavailable</Badge>
+              {s?.execution_mode === "LIVE"
+                ? <Badge tone="down">REAL MONEY</Badge>
+                : <Badge tone="neutral">Live: {s?.live_trading_available ? `available (cap ${s?.live_max_capital_usdt} USDT)` : "disabled"}</Badge>}
             </div>
-            <p className="text-xs text-muted">Changing mode requires the engine to be STOPPED and no open positions in the current mode. Testnet orders never fall back to production endpoints.</p>
+            {liveDraft !== null && (
+              <div className="space-y-2 rounded-md border border-down/60 bg-down/10 p-3 text-xs" data-testid="live-confirm">
+                <p className="font-semibold text-down">LIVE mode places real orders with real money on your Binance account.</p>
+                <p>The bot will trade at most {s?.live_max_capital_usdt} USDT (LIVE_MAX_CAPITAL_USDT). Losses are real and the strategy is not proven profitable.
+                  To continue, type <span className="font-mono font-semibold">{LIVE_PHRASE}</span>:</p>
+                <Input aria-label="Live confirmation" value={liveDraft} onChange={(e) => setLiveDraft(e.target.value)} />
+                <div className="flex gap-2">
+                  <Button variant="danger"disabled={liveDraft.trim() !== LIVE_PHRASE || save.isPending}
+                    onClick={() => save.mutate({ path: "/api/settings", body: { execution_mode: "LIVE", confirm_live: liveDraft.trim() } },
+                      { onSuccess: () => setLiveDraft(null) })}>Switch to LIVE</Button>
+                  <Button variant="outline" onClick={() => setLiveDraft(null)}>Cancel</Button>
+                </div>
+              </div>
+            )}
+            <p className="text-xs text-muted">Changing mode requires the engine to be STOPPED and no open positions in the current mode. Each mode only ever uses its own endpoint and keys.</p>
             <div className="flex items-center gap-2">
               <Switch checked={!!s?.auto_trading} label="Auto-trading" onChange={(v) => save.mutate({ path: "/api/settings", body: { auto_trading: v } })} />
               Auto-trading {s?.auto_trading ? "enabled" : "disabled (signals only)"}

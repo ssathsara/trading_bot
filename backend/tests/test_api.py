@@ -49,7 +49,7 @@ def test_password_is_hashed_with_argon2(client):
         assert u.hashed_password.startswith("$argon2") and "test-password-123" not in u.hashed_password
 
 
-def test_settings_roundtrip_and_live_mode_rejected(client, auth):
+def test_settings_roundtrip_and_live_mode_rejected_when_not_enabled(client, auth):
     r = client.get("/api/settings", headers=auth)
     body = r.json()
     assert body["execution_mode"] == "PAPER" and body["live_trading_available"] is False
@@ -67,6 +67,8 @@ def test_settings_roundtrip_and_live_mode_rejected(client, auth):
 def test_system_control_and_hard_halt_requires_reset(client, auth):
     assert client.post("/api/system/start", headers=auth).json()["state"] == "RUNNING"
     assert client.post("/api/system/pause", headers=auth).json()["state"] == "PAUSED"
+    # no halt => reset refused (it would otherwise rebase the drawdown/daily-loss baselines)
+    assert client.post("/api/system/risk/reset", headers=auth).status_code == 409
     with session_scope() as s:
         acct = pf.get_account(s, "PAPER")
         acct.halted, acct.halt_reason = True, "MAX_DRAWDOWN: test"
@@ -143,8 +145,10 @@ def test_config_fails_closed():
     from app.config import Settings
 
     base = dict(jwt_secret="x" * 40, admin_password="long-enough-pw", app_env="test")
-    with pytest.raises(ValidationError, match="LIVE|Unsupported"):
+    with pytest.raises(ValidationError, match="requires LIVE_TRADING_ENABLED"):
         Settings(**base, execution_mode="LIVE")
+    with pytest.raises(ValidationError, match="Unsupported"):
+        Settings(**base, execution_mode="MARGIN")
     with pytest.raises(ValidationError, match="not an allowed endpoint"):
         Settings(**base, binance_testnet_rest_url="https://api.binance.com")
     with pytest.raises(ValidationError, match="requires BINANCE_TESTNET"):

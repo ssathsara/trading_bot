@@ -43,7 +43,7 @@ export default function HistoryPage() {
                       <Td className="num text-right">{fmtUsd(fees)}</Td>
                       <Td className={`num text-right ${pnlClass(t.realised_pnl)}`}>{t.realised_pnl === null ? "open" : fmtUsd(t.realised_pnl, true)}</Td>
                       <Td className="text-xs text-muted">{t.exit_reason ?? "—"}</Td>
-                      <Td><Badge tone={t.execution_mode === "TESTNET" ? "info" : "primary"}>{t.execution_mode === "PAPER" ? "PAPER (sim)" : t.execution_mode}</Badge></Td>
+                      <Td><Badge tone={t.execution_mode === "LIVE" ? "down" : t.execution_mode === "TESTNET" ? "info" : "primary"}>{t.execution_mode === "PAPER" ? "PAPER (sim)" : t.execution_mode}</Badge></Td>
                       <Td><Badge tone={t.status === "CLOSED" ? "neutral" : "primary"}>{t.status}</Badge></Td>
                     </tr>
                   );

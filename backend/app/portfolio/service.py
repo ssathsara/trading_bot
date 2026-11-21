@@ -38,10 +38,18 @@ def get_account(session: Session, mode: str, initial_balance: Decimal | None = N
         stmt = stmt.with_for_update()
     acct = session.scalar(stmt)
     if acct is None:
-        bal = initial_balance if initial_balance is not None else Decimal("10000")
+        if initial_balance is None:
+            from app.config import get_settings  # the mode's configured start (LIVE: the capital cap)
+
+            initial_balance = get_settings().initial_balance_for(mode)
+        bal = initial_balance
         acct = AccountState(execution_mode=mode, initial_balance=bal, cash_balance=bal, total_fees=ZERO,
                             realised_pnl=ZERO, peak_equity=bal, day_start_equity=bal, day_start_date=today_utc(),
                             consecutive_losses=0, halted=False)
+        if bal <= 0:
+            # e.g. LIVE selected but LIVE_MAX_CAPITAL_USDT not set: show an empty ledger, but never
+            # persist one - its starting balance could not be corrected later.
+            return acct
         session.add(acct)
         session.flush()
     return acct

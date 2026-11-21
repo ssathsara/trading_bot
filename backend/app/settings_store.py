@@ -127,7 +127,7 @@ class ExecutionSettings(BaseModel):
     paper_slippage_bps: Decimal = Field(D("5"), ge=0, le=500)
     estimated_fee_rate: Decimal = Field(D("0.001"), ge=0, le=D("0.01"))
     estimated_slippage_bps: Decimal = Field(D("5"), ge=0, le=500)
-    # TESTNET: keep a resting stop-loss order on the exchange for every open position, so
+    # TESTNET / LIVE: keep a resting stop-loss order on the exchange for every open position, so
     # the position stays protected while the bot is offline. It sits this far below the
     # bot's own stop, so the bot normally exits first and the exchange stop is the backstop.
     exchange_stop_enabled: bool = True
@@ -145,7 +145,7 @@ class TradingControl(BaseModel):
 
     state: Literal["STOPPED", "RUNNING", "PAUSED"] = "STOPPED"
     auto_trading: bool = True
-    execution_mode: Literal["PAPER", "TESTNET"] = "PAPER"
+    execution_mode: Literal["PAPER", "TESTNET", "LIVE"] = "PAPER"
 
 
 GROUPS: dict[str, type[BaseModel]] = {

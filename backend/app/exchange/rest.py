@@ -4,6 +4,8 @@
 ``TestnetClient``      — signed requests; refuses to talk to anything but the
                           Spot Testnet host (defence in depth on top of config
                           validation).
+``LiveClient``         — signed requests to the production Spot API (REAL MONEY);
+                          refuses any host outside the production allowlist.
 """
 from __future__ import annotations
 
@@ -18,7 +20,7 @@ from urllib.parse import urlencode, urlparse
 
 import httpx
 
-from app.config import MARKET_DATA_REST_HOSTS, TESTNET_REST_HOSTS
+from app.config import LIVE_REST_HOSTS, MARKET_DATA_REST_HOSTS, TESTNET_REST_HOSTS
 
 log = logging.getLogger(__name__)
 
@@ -153,22 +155,25 @@ class PublicMarketClient(_BaseClient):
 TIMESTAMP_OUTSIDE_RECV_WINDOW = -1021
 
 
-class TestnetClient(_BaseClient):
-    """Signed client for the Binance Spot TESTNET only."""
+class SignedClient(_BaseClient):
+    """Signed Binance Spot client bound to one host allowlist (set by the subclass)."""
 
-    __test__ = False  # not a pytest test class
+    ALLOWED_HOSTS: frozenset[str] = frozenset()
+    VENUE = "signed"
 
     def __init__(self, base_url: str, api_key: str, api_secret: str, recv_window: int = 5000, **kw: Any) -> None:
-        super().__init__(base_url, TESTNET_REST_HOSTS, **kw)
+        if not self.ALLOWED_HOSTS:
+            raise TypeError("use TestnetClient or LiveClient")
+        super().__init__(base_url, set(self.ALLOWED_HOSTS), **kw)
         if not api_key or not api_secret:
-            raise ValueError("testnet credentials are required")
+            raise ValueError(f"{self.VENUE} credentials are required")
         self._key = api_key
         self._secret = api_secret.encode()
         self._recv_window = recv_window
         self._time_offset_ms = 0
 
     def __repr__(self) -> str:  # never leak credentials via repr
-        return f"TestnetClient(base_url={self.base_url!r})"
+        return f"{type(self).__name__}(base_url={self.base_url!r})"
 
     async def sync_time(self) -> None:
         data = await self._request("GET", "/api/v3/time")
@@ -184,8 +189,8 @@ class TestnetClient(_BaseClient):
 
     async def _signed(self, method: str, path: str, params: dict) -> Any:
         # Defence in depth: re-check the host at every signed call.
-        if (urlparse(self.base_url).hostname or "").lower() not in TESTNET_REST_HOSTS:
-            raise BinanceError("signed request blocked: non-testnet host")
+        if (urlparse(self.base_url).hostname or "").lower() not in self.ALLOWED_HOSTS:
+            raise BinanceError(f"signed request blocked: host not allowed for {self.VENUE}")
         retries = 0 if method != "GET" else 2
         try:
             return await self._request(method, path, self._sign(params), headers={"X-MBX-APIKEY": self._key}, retries=retries)
@@ -233,3 +238,18 @@ class TestnetClient(_BaseClient):
 
     async def my_trades(self, symbol: str, order_id: int) -> list[dict]:
         return await self._signed("GET", "/api/v3/myTrades", {"symbol": symbol, "orderId": order_id})
+
+
+class TestnetClient(SignedClient):
+    """Signed client for the Binance Spot TESTNET only."""
+
+    __test__ = False  # not a pytest test class
+    ALLOWED_HOSTS = frozenset(TESTNET_REST_HOSTS)
+    VENUE = "testnet"
+
+
+class LiveClient(SignedClient):
+    """Signed client for the production Binance Spot API. REAL MONEY."""
+
+    ALLOWED_HOSTS = frozenset(LIVE_REST_HOSTS)
+    VENUE = "live"

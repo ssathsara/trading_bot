@@ -29,13 +29,13 @@ from app.analysis import ml
 from app.analysis.indicators import compute_indicators
 from app.analysis.strategy import MarketRegime, SignalResult, evaluate, market_regime
 from app.audit import log_event, risk_event
-from app.config import ExecutionMode, Settings
+from app.config import EXCHANGE_MODES, ExecutionMode, Settings
 from app.db import numeric, session_scope
 from app.events import bus
 from app.exchange.filters import SymbolFilters, round_step
-from app.exchange.rest import BinanceError, PublicMarketClient, TestnetClient
+from app.exchange.rest import BinanceError, LiveClient, PublicMarketClient, TestnetClient
 from app.exchange.websocket import BookTickerEvent, KlineEvent, MarketStreamManager, ShardedStreamManager, TickerEvent, TradeEvent
-from app.execution.adapters import TERMINAL, PaperExecutionAdapter, TestnetExecutionAdapter
+from app.execution.adapters import TERMINAL, LiveExecutionAdapter, PaperExecutionAdapter, TestnetExecutionAdapter
 from app.execution.order_manager import ACTIVE, OrderManager
 from app.market import candles as cd
 from app.market.discovery import rank_pairs
@@ -55,7 +55,7 @@ INTEGRITY_WINDOW = 300  # candles per timeframe kept hole-free (= what analysis 
 BACKFILL_CONCURRENCY = 4
 QUIET_BOOK_MAX_AGE_S = 300  # longest a quiet-but-connected order book is trusted
 SIGNAL_RETENTION_DAYS = 14  # HOLD signals that led to no action are pruned after this
-# Exchange-side protective stops (TESTNET)
+# Exchange-side protective stops (TESTNET / LIVE)
 STOP_REPLACE_STEP = Decimal("0.0025")  # move the exchange stop only once the bot's stop rose 0.25%
 STOP_LIMIT_OFFSET = Decimal("0.02")  # STOP_LOSS_LIMIT fallback: limit price 2% under the trigger
 STOP_RETRY_SECONDS = 300  # after a rejected stop placement, wait before trying again
@@ -76,6 +76,11 @@ class TradingEngine:
             self.testnet = TestnetClient(settings.binance_testnet_rest_url,
                                          settings.binance_testnet_api_key.get_secret_value(),
                                          settings.binance_testnet_api_secret.get_secret_value())
+        self.live: LiveClient | None = None
+        if settings.live_configured:
+            self.live = LiveClient(settings.binance_live_rest_url,
+                                   settings.binance_live_api_key.get_secret_value(),
+                                   settings.binance_live_api_secret.get_secret_value())
         self.stream = stream or ShardedStreamManager(settings.market_data_ws_url, self.on_market_event, self.on_stream_status)
         self.filters: dict[str, SymbolFilters] = {}
         self.testnet_symbols: set[str] | None = None
@@ -114,6 +119,11 @@ class TradingEngine:
             if self.testnet is None:
                 raise RuntimeError("TESTNET mode requested but testnet credentials are not configured")
             adapter = TestnetExecutionAdapter(self.testnet)
+        elif mode == ExecutionMode.LIVE.value:
+            if self.live is None:
+                raise RuntimeError("LIVE mode requested but live trading is not enabled/configured "
+                                   "(LIVE_TRADING_ENABLED, BINANCE_LIVE_API_KEY/SECRET, LIVE_MAX_CAPITAL_USDT)")
+            adapter = LiveExecutionAdapter(self.live)
         else:
             adapter = self.paper
         return OrderManager(adapter, mode, self.filters.get, self._fee_asset_rate)
@@ -173,11 +183,21 @@ class TradingEngine:
         with session_scope() as s:
             ctl = get_control(s)
             self.mode = ctl.execution_mode
-            pf.get_account(s, self.mode, self.settings.initial_balance_usdt)
+        # Validate the mode BEFORE creating its ledger: a LIVE ledger created while live trading
+        # is not configured would be stuck with a starting balance of 0.
+        try:
+            self.om = self._build_order_manager(self.mode)
+        except RuntimeError as exc:
+            with session_scope() as s:
+                log_event(s, "worker", f"Trading worker cannot start: {exc}. Fix .env or switch the mode in System "
+                          "Settings.", "ERROR", category="system")
+            raise
+        with session_scope() as s:
+            pf.get_account(s, self.mode, self.settings.initial_balance_for(self.mode))
             self._apply_exec_settings(s)
-            log_event(s, "worker", f"Trading worker starting (mode={self.mode}, state={ctl.state}, "
-                      f"{'SIMULATED' if self.mode == 'PAPER' else 'TESTNET'} execution)", category="system")
-        self.om = self._build_order_manager(self.mode)
+            label = {"PAPER": "SIMULATED", "TESTNET": "TESTNET", "LIVE": "LIVE - REAL MONEY"}.get(self.mode, self.mode)
+            log_event(s, "worker", f"Trading worker starting (mode={self.mode}, state={ctl.state}, {label} execution)",
+                      "WARNING" if self.mode == "LIVE" else "INFO", category="system")
         await self.refresh_exchange_info()
         # ---- restart recovery: never re-place, always reconcile
         restored = self.om.restore_paper_orders() if self.mode == "PAPER" else 0
@@ -221,6 +241,8 @@ class TradingEngine:
         await self.public.close()
         if self.testnet:
             await self.testnet.close()
+        if self.live:
+            await self.live.close()
 
     async def _loop(self, fn, interval: float) -> None:
         while not self._stopping:
@@ -288,7 +310,7 @@ class TradingEngine:
                     s.add(row)
                 allowed = not mk.selected_symbols or c.symbol in mk.selected_symbols
                 row.market_rank, row.testnet_supported = c.rank, c.testnet_supported
-                row.enabled = allowed and (self.mode == "PAPER" or c.testnet_supported)
+                row.enabled = allowed and (self.mode != "TESTNET" or c.testnet_supported)
                 row.quote_volume_24h, row.price_change_pct_24h, row.last_price = c.quote_volume, c.change_pct, c.last_price
                 row.filters, row.exclusion_reason = c.filters.to_json(), None
                 if self.mode == "TESTNET" and not c.testnet_supported:
@@ -696,20 +718,30 @@ class TradingEngine:
                 risk_event(s, "TRADE_REJECTED", "INFO", f"{symbol} BUY rejected by risk engine: " + "; ".join(decision.reasons),
                            {"signal_id": signal_id, "decision": decision.to_dict()})
             return
-        # Balance check against the venue itself in TESTNET mode
-        if self.mode == "TESTNET":
+        # LIVE: hard capital cap, independent of the risk settings
+        if self.mode == "LIVE":
+            cap = self.settings.live_max_capital_usdt
+            if acct.invested + decision.notional > cap:
+                self._set_signal_status(signal_id, "LIVE_CAPITAL_CAP")
+                with session_scope() as s:
+                    risk_event(s, "LIVE_CAPITAL_CAP", "WARNING",
+                               f"{symbol} entry blocked: invested {acct.invested:.2f} + {decision.notional:.2f} "
+                               f"would exceed LIVE_MAX_CAPITAL_USDT {cap}")
+                return
+        # Balance check against the venue itself in TESTNET / LIVE mode
+        if self.mode in EXCHANGE_MODES:
             try:
                 free = await self.om.adapter.free_balance(f.quote_asset)
             except BinanceError as exc:
                 self._set_signal_status(signal_id, "BALANCE_CHECK_FAILED")
                 with session_scope() as s:
-                    log_event(s, "orders", f"Testnet balance check failed ({exc}); entry skipped", "WARNING", category="api_error")
+                    log_event(s, "orders", f"{self.mode} balance check failed ({exc}); entry skipped", "WARNING", category="api_error")
                 return
             needed = decision.notional * (1 + ex.estimated_fee_rate)
             if free < needed:
                 self._set_signal_status(signal_id, "INSUFFICIENT_BALANCE")
                 with session_scope() as s:
-                    risk_event(s, "INSUFFICIENT_BALANCE", "WARNING", f"Testnet {f.quote_asset} balance {free} < required {needed:.2f}")
+                    risk_event(s, "INSUFFICIENT_BALANCE", "WARNING", f"{self.mode} {f.quote_asset} balance {free} < required {needed:.2f}")
                 return
         price = None
         if not market_order:
@@ -852,13 +884,13 @@ class TradingEngine:
             await self.om.reconcile()
 
     async def protect_tick(self) -> None:
-        """TESTNET: keep exactly one resting stop-loss order on the exchange per open position.
+        """TESTNET / LIVE: keep exactly one resting stop-loss order on the exchange per open position.
 
         The bot's own stop-loss only works while the bot runs and receives prices. The
         exchange stop sits ``exchange_stop_buffer_pct`` under it, so it normally never
         fires; it is the backstop when the worker is down, asleep or blind."""
         om = self.om
-        if om is None or self.mode != "TESTNET" or not self.has_lease:
+        if om is None or self.mode not in EXCHANGE_MODES or not self.has_lease:
             return
         with session_scope() as s:
             ex = get_execution(s)
@@ -1069,8 +1101,9 @@ class TradingEngine:
         self.mode, self.om = mode, om
         await self.refresh_exchange_info()
         with session_scope() as s:
-            pf.get_account(s, mode, self.settings.initial_balance_usdt)
-            log_event(s, "worker", f"Execution mode switched to {mode}", category="system")
+            pf.get_account(s, mode, self.settings.initial_balance_for(mode))
+            log_event(s, "worker", f"Execution mode switched to {mode}" + (" - REAL MONEY" if mode == "LIVE" else ""),
+                      "WARNING" if mode == "LIVE" else "INFO", category="system")
         await self.refresh_universe()
 
     async def discovery_tick(self) -> None:
@@ -1094,6 +1127,8 @@ class TradingEngine:
             "testnet": {"configured": self.testnet is not None,
                         "last_error": self.testnet.last_error if self.testnet else None,
                         "symbols_available": len(self.testnet_symbols) if self.testnet_symbols is not None else None},
+            "live": {"configured": self.live is not None,
+                     "last_error": self.live.last_error if self.live else None},
             "top_symbols": self.top_symbols,
             "last_discovery_at": self.last_discovery_at,
         }

@@ -9,6 +9,7 @@ export interface SystemStatus {
     stream?: { status: string; connected: boolean; healthy: boolean; reconnects: number; invalid_messages: number };
     rest?: { last_error: string | null; used_weight_1m: number } };
   testnet: { configured: boolean; last_error?: string | null; symbols_available?: number | null };
+  live?: { configured: boolean; max_capital_usdt: string; last_error?: string | null };
   risk: { halted: boolean; halt_reason: string | null; halted_at: string | null };
 }
 

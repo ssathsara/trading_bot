@@ -123,7 +123,7 @@ def create_app() -> FastAPI:
     _exact_decimals()
     app = FastAPI(
         title="AI Spot Trading Agent (Simulation)",
-        description="Paper-trading and Binance Spot TESTNET trading agent. Live trading is disabled in this release.",
+        description="Binance Spot trading agent: PAPER (simulated), TESTNET, and opt-in LIVE (real money) execution.",
         version="1.0.0",
         lifespan=lifespan,
     )

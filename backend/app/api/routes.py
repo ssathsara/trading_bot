@@ -7,7 +7,7 @@ import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Path, Query, Request
 from sqlalchemy import func, select, text
@@ -33,6 +33,8 @@ from app.worker.engine import CLOSE_REQUESTS_KEY, STATUS_KEY
 
 SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,20}$")
 Symbol = Path(..., pattern=r"^[A-Z0-9]{2,20}$", description="Binance symbol, e.g. BTCUSDT")
+# Integer primary keys: values outside the 32-bit column range are a 422, not a database error.
+DbId = Annotated[int, Path(ge=1, le=2**31 - 1)]
 
 public = APIRouter(prefix="/api")
 api = APIRouter(prefix="/api", dependencies=[Depends(current_user)])
@@ -90,7 +92,7 @@ def login(body: sc.LoginRequest, db: Session = Depends(get_db)):
 @public.get("/health")
 def health(db: Session = Depends(get_db)):
     db.execute(text("SELECT 1"))
-    return {"status": "ok", "execution_mode": current_mode(db), "live_trading": False}
+    return {"status": "ok", "execution_mode": current_mode(db), "live_trading": current_mode(db) == "LIVE"}
 
 
 @api.get("/auth/me", response_model=sc.UserOut)
@@ -236,7 +238,7 @@ async def train_ml(body: sc.MLTrainRequest, symbol: str = Symbol):
 @api.get("/trading/orders", response_model=sc.Page[sc.OrderOut])
 def orders(page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200),
            symbol: str | None = Query(None, pattern=r"^[A-Z0-9]{2,20}$"), status: str | None = Query(None, max_length=24),
-           mode: Literal["PAPER", "TESTNET", "DEMO"] | None = None, db: Session = Depends(get_db)):
+           mode: Literal["PAPER", "TESTNET", "LIVE", "DEMO"] | None = None, db: Session = Depends(get_db)):
     stmt = select(TradingOrder).where(TradingOrder.execution_mode == (mode or current_mode(db))).order_by(TradingOrder.created_at.desc())
     if symbol:
         stmt = stmt.where(TradingOrder.symbol == symbol)
@@ -246,7 +248,7 @@ def orders(page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200),
 
 
 @api.get("/trading/orders/{order_id}", response_model=sc.OrderDetail)
-def order_detail(order_id: int, db: Session = Depends(get_db)):
+def order_detail(order_id: DbId, db: Session = Depends(get_db)):
     o = db.scalar(select(TradingOrder).options(selectinload(TradingOrder.fills)).where(TradingOrder.id == order_id))
     if o is None:
         raise HTTPException(404, "order not found")
@@ -268,7 +270,7 @@ def positions(db: Session = Depends(get_db)):
 @api.get("/trading/history", response_model=sc.Page[sc.TradeOut])
 def history(page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200),
             symbol: str | None = Query(None, pattern=r"^[A-Z0-9]{2,20}$"),
-            status: Literal["OPEN", "CLOSED"] | None = None, mode: Literal["PAPER", "TESTNET", "DEMO"] | None = None,
+            status: Literal["OPEN", "CLOSED"] | None = None, mode: Literal["PAPER", "TESTNET", "LIVE", "DEMO"] | None = None,
             db: Session = Depends(get_db)):
     stmt = select(Trade).where(Trade.execution_mode == (mode or current_mode(db))).order_by(Trade.opened_at.desc())
     if symbol:
@@ -279,7 +281,7 @@ def history(page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200)
 
 
 @api.post("/trading/close-position/{position_id}", status_code=202, dependencies=write_guard)
-def close_position(position_id: int, db: Session = Depends(get_db), user: User = Depends(current_user)):
+def close_position(position_id: DbId, db: Session = Depends(get_db), user: User = Depends(current_user)):
     pos = db.get(Position, position_id)
     if pos is None or pos.status != "OPEN":
         raise HTTPException(404, "open position not found")
@@ -359,7 +361,9 @@ def _bundle(db: Session) -> sc.SettingsBundle:
     ctl = get_control(db)
     return sc.SettingsBundle(risk=get_risk(db), strategy=get_strategy(db), market=get_market(db), execution=get_execution(db),
                              execution_mode=ctl.execution_mode, auto_trading=ctl.auto_trading, state=ctl.state,
-                             testnet_configured=get_settings().testnet_configured)
+                             testnet_configured=get_settings().testnet_configured,
+                             live_trading_available=get_settings().live_configured,
+                             live_max_capital_usdt=get_settings().live_max_capital_usdt if get_settings().live_configured else None)
 
 
 @api.get("/settings", response_model=sc.SettingsBundle)
@@ -384,10 +388,16 @@ def update_settings(body: sc.SettingsUpdate, db: Session = Depends(get_db), user
             raise HTTPException(409, "stop the trading system before changing execution mode")
         if body.execution_mode == "TESTNET" and not get_settings().testnet_configured:
             raise HTTPException(422, "testnet credentials are not configured (BINANCE_TESTNET_API_KEY/SECRET)")
+        if body.execution_mode == "LIVE":
+            if not get_settings().live_configured:
+                raise HTTPException(422, "live trading is not enabled (LIVE_TRADING_ENABLED, BINANCE_LIVE_API_KEY/SECRET, "
+                                         "LIVE_MAX_CAPITAL_USDT)")
+            if (body.confirm_live or "").strip() != sc.LIVE_CONFIRMATION_PHRASE:
+                raise HTTPException(422, f"switching to LIVE requires confirm_live='{sc.LIVE_CONFIRMATION_PHRASE}'")
         if pf.open_positions(db, ctl.execution_mode):
             raise HTTPException(409, f"close all {ctl.execution_mode} positions before switching mode")
         ctl.execution_mode = body.execution_mode
-        changed.append("execution_mode")
+        changed.append(f"execution_mode={body.execution_mode}" + (" (REAL MONEY)" if body.execution_mode == "LIVE" else ""))
     save(db, "control", ctl)
     log_event(db, "settings", f"Settings updated by {user.username}: {', '.join(changed) or 'no changes'}", category="settings")
     db.commit()
@@ -411,15 +421,19 @@ def system_status(db: Session = Depends(get_db)):
     except Exception:
         db_ok = False
     ctl = get_control(db)
-    acct = pf.get_account(db, ctl.execution_mode, get_settings().initial_balance_usdt)
+    acct = pf.get_account(db, ctl.execution_mode, get_settings().initial_balance_for(ctl.execution_mode))
     db.commit()
     w = worker_status(db)
     return {
         "database": {"connected": db_ok, "dialect": db.get_bind().dialect.name},
         "control": ctl.model_dump(),
         "execution_mode": ctl.execution_mode,
-        "environment_label": "PAPER TRADING (SIMULATED)" if ctl.execution_mode == "PAPER" else "BINANCE SPOT TESTNET",
-        "live_trading_enabled": False,
+        "environment_label": {"PAPER": "PAPER TRADING (SIMULATED)", "TESTNET": "BINANCE SPOT TESTNET",
+                              "LIVE": "LIVE TRADING - REAL MONEY"}[ctl.execution_mode],
+        "live_trading_enabled": get_settings().live_configured,
+        "live": {"configured": get_settings().live_configured,
+                 "max_capital_usdt": str(get_settings().live_max_capital_usdt),
+                 "last_error": (w.get("live") or {}).get("last_error")},
         "worker": w,
         "market_data": {"stream": w.get("stream"), "rest": w.get("rest")},
         "testnet": {**(w.get("testnet") or {}), "configured": get_settings().testnet_configured},
@@ -438,7 +452,7 @@ def _set_state(db: Session, state: str, user: User, message: str) -> dict:
 
 @api.post("/system/start", dependencies=write_guard)
 def system_start(db: Session = Depends(get_db), user: User = Depends(current_user)):
-    acct = pf.get_account(db, current_mode(db), get_settings().initial_balance_usdt)
+    acct = pf.get_account(db, current_mode(db), get_settings().initial_balance_for(current_mode(db)))
     if acct.halted:
         raise HTTPException(409, f"hard risk limit active ({acct.halt_reason}); explicit reset required")
     return _set_state(db, "RUNNING", user, "Trading started")
@@ -456,7 +470,7 @@ def system_pause(db: Session = Depends(get_db), user: User = Depends(current_use
 
 @api.post("/system/resume", dependencies=write_guard)
 def system_resume(db: Session = Depends(get_db), user: User = Depends(current_user)):
-    acct = pf.get_account(db, current_mode(db), get_settings().initial_balance_usdt)
+    acct = pf.get_account(db, current_mode(db), get_settings().initial_balance_for(current_mode(db)))
     if acct.halted:
         raise HTTPException(409, f"hard risk limit active ({acct.halt_reason}); explicit reset required")
     return _set_state(db, "RUNNING", user, "Trading resumed")
@@ -467,6 +481,10 @@ def risk_reset(db: Session = Depends(get_db), user: User = Depends(current_user)
     """Explicitly acknowledge a hard-limit halt. Daily/peak baselines restart from current equity."""
     mode = current_mode(db)
     acct = pf.get_account(db, mode)
+    if not acct.halted:
+        # Resetting without a halt would silently rebase the drawdown / daily-loss baselines
+        # and so loosen those limits.
+        raise HTTPException(409, "no hard-limit halt is active; nothing to reset")
     v = pf.mark_to_market(db, mode, price_from_db(db))
     prev = acct.halt_reason
     acct.halted, acct.halt_reason, acct.halted_at = False, None, None
@@ -578,7 +596,7 @@ def backtest_results(page: int = Query(1, ge=1), page_size: int = Query(20, ge=1
 
 
 @api.get("/backtest/results/{run_id}", response_model=sc.BacktestDetail)
-def backtest_result(run_id: int, db: Session = Depends(get_db)):
+def backtest_result(run_id: DbId, db: Session = Depends(get_db)):
     run = db.get(BacktestRun, run_id)
     if run is None:
         raise HTTPException(404, "backtest not found")

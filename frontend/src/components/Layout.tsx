@@ -24,7 +24,7 @@ const NAV = [
   { to: "/logs", label: "Activity Logs", icon: ScrollText },
 ];
 
-/** Always-visible environment indicator. There is no live-trading state in this release. */
+/** Always-visible environment indicator. LIVE (real money) is shown as a solid red bar. */
 export function EnvironmentBanner() {
   const { data } = useStatus();
   const mode = data?.execution_mode ?? "PAPER";
@@ -32,11 +32,14 @@ export function EnvironmentBanner() {
   const halted = data?.risk.halted;
   return (
     <div data-testid="env-banner" className={cn("flex flex-wrap items-center gap-x-4 gap-y-1 px-4 py-1.5 text-xs font-medium",
-      mode === "TESTNET" ? "bg-info/15 text-info" : "bg-primary/15 text-primary")}>
+      mode === "LIVE" ? "bg-down text-white" : mode === "TESTNET" ? "bg-info/15 text-info" : "bg-primary/15 text-primary")}>
       <span className="font-semibold tracking-wide">
-        {mode === "TESTNET" ? "BINANCE SPOT TESTNET — test funds only" : "PAPER TRADING — simulated funds, no real orders"}
+        {mode === "LIVE" ? "LIVE TRADING — REAL MONEY, REAL ORDERS"
+          : mode === "TESTNET" ? "BINANCE SPOT TESTNET — test funds only" : "PAPER TRADING — simulated funds, no real orders"}
       </span>
-      <span>Live trading: disabled</span>
+      {mode === "LIVE"
+        ? <span>Capital cap: {data?.live?.max_capital_usdt ?? "—"} USDT</span>
+        : <span>Live trading: {data?.live_trading_enabled ? "available" : "disabled"}</span>}
       <span>Engine: {state}</span>
       {halted && <span className="text-down">HARD RISK LIMIT ACTIVE — reset required</span>}
     </div>
