@@ -164,7 +164,9 @@ def evaluate_entry(req: EntryRequest, acct: AccountSnapshot, rs: RiskSettings, e
     rr = reward_per_unit / risk_per_unit
     d.stop_loss, d.take_profit, d.reward_risk = stop, target, rr.quantize(Decimal("0.01"))
     if rr < rs.min_reward_risk:
-        rej.append(f"reward/risk after costs {rr:.2f} below minimum {rs.min_reward_risk}")
+        # round DOWN so a near-miss never reads "1.50 below minimum 1.5"
+        rej.append(f"reward/risk after costs {rr.quantize(Decimal('0.01'), rounding=ROUND_DOWN)} "
+                   f"below minimum {rs.min_reward_risk}")
         return d
 
     # ---- Position sizing ---------------------------------------------------------

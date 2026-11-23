@@ -97,6 +97,7 @@ class TradingEngine:
         self.stale_reported: set[str] = set()
         self._tasks: list[asyncio.Task] = []
         self._ticker_pub: dict[str, float] = {}
+        self._last_trade_at: dict[str, float] = {}
         self._repair_attempts: dict[tuple[str, str, int], tuple[int, float]] = {}
         self._analysis_queue: asyncio.Queue[str] = asyncio.Queue()
         self._queued: set[str] = set()
@@ -482,6 +483,22 @@ class TradingEngine:
         for large ones so hundreds of symbols do not flood the browser."""
         return 1.0 if len(self.top_symbols) <= 20 else 5.0
 
+    def _price_interval(self) -> float:
+        """Live price updates per symbol: ~4/s for small universes (driven by the
+        trade stream), otherwise the normal UI interval."""
+        return 0.25 if len(self.top_symbols) <= ShardedStreamManager.TRADES_MAX_SYMBOLS else self._ui_interval()
+
+    def _publish_ticker(self, symbol: str) -> None:
+        now = time.time()
+        if now - self._ticker_pub.get(symbol, 0) < self._price_interval():
+            return
+        q = price_cache.get(symbol)
+        if q is None or q.last is None or q.change_pct is None:
+            return  # wait for the first 24h ticker so change/volume are known
+        self._ticker_pub[symbol] = now
+        bus.publish("market", "ticker", {"symbol": symbol, "price": q.last, "change_pct": q.change_pct,
+                                         "quote_volume": q.quote_volume, "bid": q.bid, "ask": q.ask})
+
     async def on_market_event(self, ev) -> None:
         if isinstance(ev, BookTickerEvent):
             price_cache.update(ev.symbol, bid=ev.bid, ask=ev.ask, bid_qty=ev.bid_qty, ask_qty=ev.ask_qty)
@@ -490,15 +507,16 @@ class TradingEngine:
             self._position_check.set()
         elif isinstance(ev, TradeEvent):
             price_cache.update(ev.symbol, last=ev.price)
+            self._last_trade_at[ev.symbol] = time.time()
+            self._publish_ticker(ev.symbol)
         elif isinstance(ev, TickerEvent):
-            price_cache.update(ev.symbol, last=ev.last_price, change_pct=ev.change_pct, quote_volume=ev.quote_volume)
-            now = time.time()
-            if now - self._ticker_pub.get(ev.symbol, 0) >= self._ui_interval():
-                self._ticker_pub[ev.symbol] = now
-                q = price_cache.get(ev.symbol)
-                bus.publish("market", "ticker", {"symbol": ev.symbol, "price": ev.last_price, "change_pct": ev.change_pct,
-                                                 "quote_volume": ev.quote_volume, "bid": q.bid if q else None,
-                                                 "ask": q.ask if q else None})
+            # the 24h ticker's "c" lags the trade stream; only take it as last price
+            # when no trade has arrived recently (trade stream off for big universes)
+            fields = {"change_pct": ev.change_pct, "quote_volume": ev.quote_volume}
+            if time.time() - self._last_trade_at.get(ev.symbol, 0) > 5:
+                fields["last"] = ev.last_price
+            price_cache.update(ev.symbol, **fields)
+            self._publish_ticker(ev.symbol)
         elif isinstance(ev, KlineEvent):
             key, now = f"{ev.symbol}:{ev.interval}", time.time()
             if ev.closed or now - self._ticker_pub.get(key, 0) >= self._ui_interval():
