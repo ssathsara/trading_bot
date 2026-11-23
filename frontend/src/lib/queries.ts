@@ -6,7 +6,7 @@ export interface SystemStatus {
   database: { connected: boolean; dialect: string };
   control: Control; execution_mode: string; environment_label: string; live_trading_enabled: boolean;
   worker: { alive: boolean; heartbeat?: number; uptime_seconds?: number; top_symbols?: string[];
-    stream?: { status: string; connected: boolean; healthy: boolean; reconnects: number; invalid_messages: number };
+    stream?: { status: string; connected: boolean; healthy: boolean; reconnects: number; invalid_messages: number; lag_s?: number | null };
     rest?: { last_error: string | null; used_weight_1m: number } };
   testnet: { configured: boolean; last_error?: string | null; symbols_available?: number | null };
   live?: { configured: boolean; max_capital_usdt: string; last_error?: string | null };

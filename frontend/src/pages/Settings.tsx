@@ -85,7 +85,7 @@ export default function SettingsPage() {
           <CardContent>
             <Row label="Database" ok={st?.database.connected} detail={st?.database.dialect} />
             <Row label="Trading worker" ok={st?.worker.alive} detail={st?.worker.uptime_seconds ? `up ${fmtDuration(st.worker.uptime_seconds)}` : undefined} />
-            <Row label="Binance market stream" ok={st?.worker.stream?.healthy} detail={`${st?.worker.stream?.status ?? "—"} · ${st?.worker.stream?.reconnects ?? 0} reconnects`} />
+            <Row label="Binance market stream" ok={st?.worker.stream?.healthy} detail={`${st?.worker.stream?.status ?? "—"} · ${st?.worker.stream?.reconnects ?? 0} reconnects${st?.worker.stream?.lag_s != null ? ` · ${st.worker.stream.lag_s}s lag` : ""}`} />
             <Row label="Binance REST API" ok={st ? !st.worker.rest?.last_error : undefined} detail={st?.worker.rest?.last_error ?? `weight ${st?.worker.rest?.used_weight_1m ?? 0}/min`} />
             <Row label="Spot Testnet" ok={st?.testnet.configured ? !st.testnet.last_error : undefined}
               detail={st?.testnet.configured ? (st.testnet.last_error ?? "credentials configured") : `not configured · ${st?.testnet.symbols_available ?? "?"} symbols listed`} />
@@ -99,7 +99,7 @@ export default function SettingsPage() {
                 {(["trend_timeframe", "setup_timeframe", "entry_timeframe"] as const).map((k) => (
                   <label key={k} className="text-xs text-muted">{k.replace("_timeframe", "")} timeframe
                     <Select className="mt-1 w-full" value={strategy[k]} onChange={(e) => setStrategy({ ...strategy, [k]: e.target.value })}>
-                      {({ trend_timeframe: ["15m", "1h", "4h", "1d"], setup_timeframe: ["5m", "15m", "1h"], entry_timeframe: ["1m", "5m", "15m"] })[k].map((t) => <option key={t}>{t}</option>)}
+                      {({ trend_timeframe: ["15m", "1h", "4h", "1d"], setup_timeframe: ["5m", "15m", "1h"], entry_timeframe: ["1m", "5m", "15m", "1h"] })[k].map((t) => <option key={t}>{t}</option>)}
                     </Select></label>
                 ))}
                 {field(strategy, setStrategy, "rsi_entry_min", "RSI entry min")}

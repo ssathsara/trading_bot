@@ -49,16 +49,18 @@ export function EnvironmentBanner() {
 function ConnectionDots() {
   const sockets = useLive((s) => s.socket);
   const { data } = useStatus();
-  const items: [string, boolean][] = [
+  const stream = data?.worker.stream;
+  const marketDetail = stream ? `${stream.status}${stream.lag_s != null ? ` · data ${stream.lag_s}s behind` : ""}` : undefined;
+  const items: [string, boolean, string?][] = [
     ["API", !!data],
     ["Worker", !!data?.worker.alive],
-    ["Market", !!data?.worker.stream?.healthy],
+    ["Market", !!stream?.healthy, marketDetail],
     ["Live", sockets.dashboard === "open"],
   ];
   return (
     <div className="flex items-center gap-3 text-xs text-muted">
-      {items.map(([label, ok]) => (
-        <span key={label} className="flex items-center gap-1.5" title={`${label}: ${ok ? "connected" : "disconnected"}`}>
+      {items.map(([label, ok, detail]) => (
+        <span key={label} className="flex items-center gap-1.5" title={`${label}: ${detail ?? (ok ? "connected" : "disconnected")}`}>
           <span className={cn("h-2 w-2 rounded-full", ok ? "bg-up" : "bg-down")} />{label}
         </span>
       ))}

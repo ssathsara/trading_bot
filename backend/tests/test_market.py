@@ -256,6 +256,38 @@ async def test_websocket_reconnects_with_backoff_and_heartbeat():
     assert task.done()
 
 
+def trade_msg(trade_id, t_ms):
+    return json.dumps({"stream": "btcusdt@trade", "data": {"e": "trade", "E": t_ms, "s": "BTCUSDT", "t": trade_id,
+                                                          "p": "100", "q": "1", "T": t_ms}})
+
+
+async def test_websocket_detects_lagging_data_with_hysteresis():
+    now = 1_000_000.0  # local clock, seconds
+    # trade times relative to now: fresh, 12s late (lagging), 7s late (still lagging), 2s late (recovered)
+    lags = [0.5, 12, 7, 2]
+    statuses, seen = [], []
+
+    async def on_event(ev):
+        seen.append((m.lagging, m.is_healthy()))
+
+    async def on_status(st, info):
+        statuses.append((st, info.get("lag")))
+
+    msgs = [trade_msg(i + 1, int((now - lag) * 1000)) for i, lag in enumerate(lags)]
+    m = MarketStreamManager("wss://x", on_event, on_status, heartbeat_timeout=5, max_backoff=0.05,
+                            connect=lambda url: FakeWS(msgs, then="hang"), max_lag=10, clock=lambda: now)
+    m.set_subscriptions(["BTCUSDT"], ["1m"])
+    m.start()
+    for _ in range(100):
+        if len(seen) >= 4:
+            break
+        await asyncio.sleep(0.02)
+    await m.stop()
+    assert [st for st, _ in statuses][:3] == ["connected", "lagging", "connected"]  # then "disconnected" on stop
+    assert statuses[1][1] == 12.0
+    assert seen == [(False, True), (True, False), (True, False), (False, True)]
+
+
 # ---------------------------------------------------------------- REST
 @respx.mock
 async def test_public_client_parsing_and_rate_limit():

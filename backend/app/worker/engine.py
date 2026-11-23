@@ -439,6 +439,10 @@ class TradingEngine:
             log_event(s, "websocket", f"Market stream {status} {info or ''}".strip(), level, category="websocket")
             if status == "stale":
                 risk_event(s, "STALE_MARKET_DATA", "WARNING", "Market data stream went silent; new entries blocked until data resumes")
+            elif status == "lagging":
+                risk_event(s, "STALE_MARKET_DATA", "WARNING",
+                           f"Market data is {info.get('lag', '?')}s behind real time (slow connection?); "
+                           "new entries blocked until it catches up")
         if status == "connected" and prev in ("reconnecting", "disconnected", "stale", "error"):
             # keep a reference: the loop only holds weak refs, so an unreferenced task can be GC'd mid-run
             task = asyncio.create_task(self._gap_fill(), name="gap-fill")
@@ -1140,6 +1144,7 @@ class TradingEngine:
             "uptime_seconds": int(time.time() - self.started_at) if self.started_at else 0,
             "stream": {"status": self.stream_status, "connected": self.stream.connected,
                        "healthy": self.stream.is_healthy(), "reconnects": self.stream.reconnects,
+                       "lag_s": round(self.stream.lag_s, 1) if self.stream.lag_s is not None else None,
                        "invalid_messages": self.stream.invalid_messages},
             "rest": {"last_error": self.public.last_error, "used_weight_1m": self.public.used_weight_1m},
             "testnet": {"configured": self.testnet is not None,

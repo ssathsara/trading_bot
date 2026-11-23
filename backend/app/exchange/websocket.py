@@ -2,8 +2,9 @@
 
 Features: combined streams, automatic reconnection with exponential backoff and
 jitter, heartbeat watchdog (forces reconnect when the socket goes silent),
-payload validation, duplicate/out-of-order protection, and proactive reconnect
-before Binance's 24h connection limit.
+lag detection (data arriving late, e.g. on a slow connection), payload
+validation, duplicate/out-of-order protection, and proactive reconnect before
+Binance's 24h connection limit.
 """
 from __future__ import annotations
 
@@ -154,7 +155,8 @@ class MarketStreamManager:
     def __init__(self, base_url: str, on_event: Handler, on_status: StatusHandler | None = None, *,
                  heartbeat_timeout: float = 30.0, max_backoff: float = 60.0,
                  max_connection_age: float = 23 * 3600, connect: Callable | None = None,
-                 include_trades: bool = True) -> None:
+                 include_trades: bool = True, max_lag: float = 10.0,
+                 clock: Callable[[], float] = time.time) -> None:
         self.base_url = base_url.rstrip("/")
         self.on_event = on_event
         self.on_status = on_status
@@ -172,6 +174,32 @@ class MarketStreamManager:
         self.invalid_messages = 0
         self.dedup = Deduplicator()
         self._task: asyncio.Task | None = None
+        # Lag = local clock minus the exchange's event time. A live socket can still
+        # deliver data late when the connection is slower than the feed: messages queue
+        # up and fall further behind (the heartbeat never fires because data keeps
+        # arriving). Above ``max_lag`` the stream reports "lagging" and is unhealthy;
+        # it recovers below half of that (hysteresis). Lag includes local clock skew.
+        self.max_lag = max_lag
+        self._clock = clock
+        self.lag_s: float | None = None
+        self.lagging = False
+
+    def _observe_lag(self, ev: MarketEvent) -> bool:
+        """Update lag from an event's exchange timestamp. True if the lagging state changed."""
+        if isinstance(ev, TickerEvent):
+            event_ms = ev.event_time
+        elif isinstance(ev, TradeEvent):
+            event_ms = ev.trade_time
+        else:
+            return False
+        self.lag_s = max(0.0, self._clock() - event_ms / 1000)
+        if not self.lagging and self.lag_s > self.max_lag:
+            self.lagging = True
+            return True
+        if self.lagging and self.lag_s < self.max_lag / 2:
+            self.lagging = False
+            return True
+        return False
 
     def build_streams(self, symbols: list[str], timeframes: list[str]) -> list[str]:
         streams: list[str] = []
@@ -194,7 +222,7 @@ class MarketStreamManager:
         return f"{self.base_url}/stream?streams={'/'.join(self._streams)}"
 
     def is_healthy(self, max_silence: float | None = None) -> bool:
-        if not self.connected or self.last_message_at is None:
+        if not self.connected or self.last_message_at is None or self.lagging:
             return False
         return time.monotonic() - self.last_message_at <= (max_silence or self.heartbeat_timeout)
 
@@ -265,6 +293,7 @@ class MarketStreamManager:
                                                      max_size=2 ** 22, open_timeout=15)
         async with connect(self.url) as ws:
             self.connected = True
+            self.lagging, self.lag_s = False, None
             self.last_message_at = time.monotonic()
             opened = time.monotonic()
             await self._status("connected", streams=len(self._streams))
@@ -287,13 +316,18 @@ class MarketStreamManager:
                     continue
                 if ev is None or not self.dedup.accept(ev):
                     continue
+                if self._observe_lag(ev):
+                    lag = round(self.lag_s or 0.0, 1)
+                    if self.lagging:
+                        log.warning("market data is %.1fs behind real time (max %.0fs)", lag, self.max_lag)
+                    await self._status("lagging" if self.lagging else "connected", lag=lag)
                 try:
                     await self.on_event(ev)
                 except Exception:
                     log.exception("market event handler failed")
 
 
-_STATUS_SEVERITY = {"connected": 0, "init": 1, "reconnecting": 2, "disconnected": 3, "stale": 4, "error": 5}
+_STATUS_SEVERITY = {"connected": 0, "init": 1, "reconnecting": 2, "lagging": 3, "disconnected": 4, "stale": 5, "error": 6}
 
 
 class ShardedStreamManager:
@@ -338,6 +372,11 @@ class ShardedStreamManager:
     def invalid_messages(self) -> int:
         return sum(s.invalid_messages for s in self.shards)
 
+    @property
+    def lag_s(self) -> float | None:
+        lags = [s.lag_s for s in self.shards if s.lag_s is not None]
+        return max(lags) if lags else None
+
     def is_healthy(self, max_silence: float | None = None) -> bool:
         return bool(self.shards) and all(s.is_healthy(max_silence) for s in self.shards)
 
@@ -349,7 +388,7 @@ class ShardedStreamManager:
             if idx >= len(self._shard_status):
                 return
             self._shard_status[idx] = status
-            agg = max(self._shard_status, key=lambda st: _STATUS_SEVERITY.get(st, 5))
+            agg = max(self._shard_status, key=lambda st: _STATUS_SEVERITY.get(st, 6))
             if agg != self._reported:
                 self._reported = agg
                 if self.on_status:
