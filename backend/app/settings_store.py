@@ -79,7 +79,7 @@ class StrategySettings(BaseModel):
     name: str = "trend_following_v1"
     trend_timeframe: Literal["15m", "1h", "4h", "1d"] = "1h"
     setup_timeframe: Literal["5m", "15m", "1h"] = "15m"
-    entry_timeframe: Literal["1m", "5m", "15m"] = "5m"
+    entry_timeframe: Literal["1m", "5m", "15m", "1h"] = "5m"
     rsi_entry_min: Decimal = Field(D("45"), ge=0, le=100)
     rsi_entry_max: Decimal = Field(D("70"), ge=0, le=100)
     min_adx: Decimal = Field(D("20"), ge=0, le=100)
