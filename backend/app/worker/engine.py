@@ -282,8 +282,10 @@ class TradingEngine:
         # Rank without history first, then verify history for the leading candidates.
         groups = set(mk.excluded_permission_groups)
         common = dict(excluded=set(mk.excluded_symbols), testnet_symbols=self.testnet_symbols,
-                      excluded_permission_groups=groups, min_quote_volume=mk.min_quote_volume_usdt)
-        prelim, _ = rank_pairs(self._exchange_symbols, tickers, top_n=mk.top_n + 8 if mk.top_n > 0 else 0, **common)
+                      excluded_permission_groups=groups, min_quote_volume=mk.min_quote_volume_usdt,
+                      pinned=set(mk.pinned_symbols))
+        prelim, _ = rank_pairs(self._exchange_symbols, tickers,
+                               top_n=mk.top_n + 8 + len(mk.pinned_symbols) if mk.top_n > 0 else 0, **common)
         # Load history concurrently, but bounded: the public REST limit is 6000 weight/min
         # and the initial load for a few hundred pairs is ~1000 kline requests.
         sem = asyncio.Semaphore(BACKFILL_CONCURRENCY)

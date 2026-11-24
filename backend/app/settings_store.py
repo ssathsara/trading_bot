@@ -111,6 +111,7 @@ class MarketSettings(BaseModel):
     min_history_candles: int = Field(250, ge=50, le=1000)
     history_candles: int = Field(300, ge=100, le=1000)
     excluded_symbols: list[str] = []
+    pinned_symbols: list[str] = []  # always in the universe (if eligible), on top of the top-N
     # Binance lists tokenized equities/ETFs (e.g. NVDAB, SOXLB - some leveraged) as ordinary
     # spot pairs with no documented flag. Empirically they all sit in this permission group.
     # It is an observation, not an API contract - review periodically.

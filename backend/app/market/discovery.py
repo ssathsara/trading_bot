@@ -75,6 +75,7 @@ def rank_pairs(
     history_ok: dict[str, bool] | None = None,
     excluded_permission_groups: set[str] | None = None,
     min_quote_volume: Decimal = Decimal("0"),
+    pinned: set[str] | None = None,
 ) -> tuple[list[PairCandidate], list[PairCandidate]]:
     """Rank pairs by 24h quote volume.
 
@@ -84,8 +85,11 @@ def rank_pairs(
     Symbols failing ``history_ok`` are skipped (that is part
     of eligibility, not a substitution). Testnet availability is *reported* via
     ``testnet_supported`` but never causes a substitution.
+    ``pinned`` symbols are always selected when eligible, even beyond ``top_n``
+    (they still have to pass every safety/eligibility rule).
     """
     excluded = excluded or set()
+    pinned = pinned or set()
     tick = {t["symbol"]: t for t in tickers}
     candidates: list[PairCandidate] = []
     for s in exchange_symbols:
@@ -117,7 +121,7 @@ def rank_pairs(
     for c in candidates:
         if c.eligible and history_ok is not None and not history_ok.get(c.symbol, False):
             c.eligible, c.exclusion_reason = False, "insufficient historical data"
-        if c.eligible and (top_n <= 0 or len(selected) < top_n):
+        if c.eligible and (top_n <= 0 or len(selected) < top_n or c.symbol in pinned):
             c.rank = len(selected) + 1
             selected.append(c)
         elif not c.eligible:

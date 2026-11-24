@@ -78,6 +78,14 @@ def test_top_n_limit_and_volume_order():
     assert all(a.quote_volume >= b.quote_volume for a, b in zip(selected, selected[1:]))
 
 
+def test_pinned_symbols_added_beyond_top_n():
+    symbols = [exchange_symbol(f"C{i}USDT", f"C{i}") for i in range(15)] + [exchange_symbol("USDCUSDT", "USDC")]
+    tickers = [_ticker(f"C{i}USDT", (i + 1) * 10) for i in range(15)] + [_ticker("USDCUSDT", 1)]
+    selected, _ = rank_pairs(symbols, tickers, top_n=3, pinned={"C0USDT", "USDCUSDT"})
+    assert [c.symbol for c in selected] == ["C14USDT", "C13USDT", "C12USDT", "C0USDT"]  # ineligible pin ignored
+    assert selected[-1].rank == 4
+
+
 def test_all_pairs_mode_and_liquidity_floor():
     symbols = [exchange_symbol(f"C{i}USDT", f"C{i}") for i in range(1, 51)]
     tickers = [_ticker(f"C{i}USDT", i * 100_000) for i in range(1, 51)]  # 0.1M .. 5M

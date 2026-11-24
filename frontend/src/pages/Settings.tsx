@@ -139,6 +139,9 @@ export default function SettingsPage() {
                 <label className="col-span-full text-xs text-muted">Selected cryptocurrencies (comma-separated; empty = every pair in the universe)
                   <Input className="mt-1" value={(market.selected_symbols ?? []).join(",")}
                     onChange={(e) => setMarket({ ...market, selected_symbols: e.target.value.toUpperCase().split(",").map((x: string) => x.trim()).filter(Boolean) })} /></label>
+                <label className="col-span-full text-xs text-muted">Always include (comma-separated, e.g. TRXUSDT; added on top of the top pairs)
+                  <Input className="mt-1" value={(market.pinned_symbols ?? []).join(",")}
+                    onChange={(e) => setMarket({ ...market, pinned_symbols: e.target.value.toUpperCase().split(",").map((x: string) => x.trim()).filter(Boolean) })} /></label>
                 <label className="col-span-full text-xs text-muted">Excluded symbols
                   <Input className="mt-1" value={(market.excluded_symbols ?? []).join(",")}
                     onChange={(e) => setMarket({ ...market, excluded_symbols: e.target.value.toUpperCase().split(",").map((x: string) => x.trim()).filter(Boolean) })} /></label>
